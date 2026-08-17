@@ -1,0 +1,74 @@
+name: 'Phasen-Label-Pre-Check'
+description: >-
+  Prüft zur LAUFZEIT, ob der Trigger einer Pipeline-Phase noch gültig ist (Label
+  hängt noch am Issue/PR, Zustand passt). Übergeben wird nur der Phasen-Name —
+  die Soll-Werte stehen zentral in check-phase-label.sh. Passt der IST-Zustand
+  nicht, liefert die Action proceed=false und der Job endet ohne Fehler.
+inputs:
+  phase:
+    description: 'analyse | spec | implement | review | fixup | documenter'
+    required: true
+  ticket:
+    description: 'Issue- bzw. PR-Nummer'
+    required: true
+  repo:
+    description: 'owner/repo (Default: aktuelles Repository)'
+    required: false
+    default: ${{ github.repository }}
+  trigger-label:
+    description: >-
+      Nur für Phase `analyse`: das Label aus dem Event (github.event.label.name).
+      Beim Re-Triage muss GENAU dieses Label abwesend bleiben; leer => ai:analyzed.
+    required: false
+    default: ''
+  github-token:
+    description: 'Token für die gh-Abfrage (lesend genügt)'
+    required: false
+    default: ${{ github.token }}
+outputs:
+  proceed:
+    description: 'true = Phase darf laufen, false = Trigger ist konsumiert'
+    value: ${{ steps.check.outputs.proceed }}
+  reason:
+    description: 'Klartext-Begründung, wenn proceed=false'
+    value: ${{ steps.check.outputs.reason }}
+runs:
+  using: composite
+  steps:
+    - name: Label-/Zustands-Check gegen den IST-Zustand
+      id: check
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PHASE: ${{ inputs.phase }}
+        TICKET: ${{ inputs.ticket }}
+        REPO: ${{ inputs.repo }}
+        TRIGGER_LABEL: ${{ inputs.trigger-label }}
+      run: |
+        # Ein unbekannter Phasen-Name lässt das Skript hart scheitern (exit 2) —
+        # bewusst kein Fail-open: ein Tippfehler soll laut auffallen, nicht das
+        # Gate still aushebeln.
+        OUT="$(bash "${GITHUB_ACTION_PATH}/../../scripts/check-phase-label.sh" \
+          --repo "$REPO" --phase "$PHASE" --ticket "$TICKET" \
+          --trigger-label "$TRIGGER_LABEL")"
+
+        PROCEED="$(printf '%s' "$OUT" | sed -n 's/^proceed=//p')"
+        REASON="$(printf '%s' "$OUT" | sed -n 's/^reason=//p')"
+
+        # Outputs einzeln + über Heredoc mit Zufalls-Delimiter schreiben, statt die
+        # Skript-Ausgabe roh anzuhängen: `reason` trägt Label-Namen aus dem Event,
+        # und die rohe Append-Form ist genau das Muster, mit dem ein mehrzeiliger
+        # Wert weitere Output-Keys unterschieben könnte (das Skript strippt bereits,
+        # dies ist die zweite Leine).
+        DELIM="EOF_$(date +%s%N)_$RANDOM"
+        {
+          echo "proceed=${PROCEED:-false}"
+          echo "reason<<${DELIM}"
+          printf '%s\n' "$REASON"
+          echo "${DELIM}"
+        } >> "$GITHUB_OUTPUT"
+        if [ "$PROCEED" = "true" ]; then
+          echo "::notice title=▶️ Phase ${PHASE} läuft::Trigger für #${TICKET} ist zur Laufzeit noch gültig."
+        else
+          echo "::notice title=⏭️ Phase ${PHASE} übersprungen::#${TICKET} — ${REASON:-Trigger ist konsumiert}"
+        fi

@@ -1,0 +1,359 @@
+# CALLEE: 7. Pipeline-Phase — PR-Documenter (Arbeitsteilung Regel-Logik + LLM).
+# Aufgerufen vom Stub `stubs/07-claude-pr-documenter.yml` (Trigger, Event-Fakten-if und
+# Concurrency liegen dort). Vertrag: github.event-Bezüge nur noch via Inputs; lokale
+# Actions/Scripts/Prompts aus deleonio/agent-pipeline@v1.0 bzw. .agent-pipeline/.
+# Läuft NACH einem erfolgreichen PR-Merge und pflegt Titel, Beschreibung,
+# Release-Note-Kommentar und Labels des EINEN gemergten PRs.
+# Aufteilung (empirisch: Prompt-only erzeugte driftende Kommentar-Formate und
+# unnormalisierte Titel, s. docs/ci-legacy-comparison.md):
+#   - pr-doc-facts.sh    — Bot-Erkennung, Conventional-Commits-Titelprüfung (deterministisch)
+#   - Claude (doc.json)  — NUR Klassifikation + Fließtext (Titel/Beschreibung/Kommentar-Texte)
+#   - pr-doc-render.sh   — sämtliche Schreibzugriffe: Titel-Rename, Body-Marker-Splice,
+#                          genau EIN ai-documenter-Kommentar (PATCH statt Duplikat), Labels
+# Bot-/release:ignore-PRs werden deterministisch kurzgeschlossen — ohne LLM-Lauf.
+
+name: PR-Documenter (agent-pipeline callee)
+
+on:
+  workflow_call:
+    inputs:
+      pr-number:
+        description: 'PR-Nummer des gemergten PRs (Stub löst github.event.pull_request.number || github.event.inputs.pr-number auf)'
+        required: true
+        type: string
+    secrets:
+      APP_ID:
+        description: 'GitHub App ID (App-Token-Mint in setup-claude)'
+        required: false
+      APP_PRIVATE_KEY:
+        description: 'GitHub App Private Key'
+        required: false
+      ZAI_API_KEY:
+        description: 'z.ai API-Key (Provider zai)'
+        required: false
+      CLAUDE_API_KEY:
+        description: 'Anthropic API-Key (Provider claude)'
+        required: false
+      OPENROUTER_API_KEY:
+        description: 'OpenRouter API-Key (Provider openrouter)'
+        required: false
+      TAILSCALE_AUTH_KEY:
+        description: 'Tailscale Auth-Key (Exit-Node-Egress für LLM-Traffic)'
+        required: false
+
+permissions:
+  contents: read # Claude ändert PR-Metadaten via gh, nicht den Repo-Inhalt — kein Commit mehr.
+  pull-requests: write
+  issues: write
+  # actions: write — fuer das Loeschen der Memory-Artefakte beim Issue-Memory-Abbau.
+  actions: write
+  # id-token: write — App-Token (setup-claude).
+  id-token: write
+
+env:
+  REPO: ${{ github.repository }}
+
+jobs:
+  precheck:
+    # Die unveränderlichen Event-Fakten (merged == true ODER workflow_dispatch) filtert das
+    # job-if im STUB — im Callee bleibt nur die Laufzeitprüfung.
+    # IST-Zustand zur Laufzeit: PR muss JETZT (nach dem Warten in der globalen Phasen-Queue
+    # des Stubs) noch gemergt und NOCH NICHT dokumentiert (ai:documented) sein — Letzteres ist die
+    # Idempotenz-Invariante gegen queued Doppel-Events und workflow_dispatch-Catch-up-Doppel.
+    # Soll-Werte stehen zentral in .github/scripts/check-phase-label.sh; hier wird nur der
+    # Phasen-Name übergeben (Fail-open bei API-Fehler ist dort implementiert).
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read # Laufzeit-Precheck liest PR-Status/Labels; die remote Action bringt ihr Skript mit — kein Checkout nötig.
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+    steps:
+      - name: Pre-Check (merged + noch nicht dokumentiert, zur Laufzeit)
+        id: check
+        uses: deleonio/agent-pipeline/.github/actions/check-phase-label@v1.0
+        with:
+          phase: documenter
+          ticket: ${{ inputs.pr-number }}
+
+  document-merged-pr:
+    name: Document Merged PR (Claude)
+    needs: precheck
+    # Nur bei ECHTEM Merge laufen (AK2/AK3): pull_request:[closed] feuert auch beim Schliessen-ohne-
+    # Merge — das filtert bereits das Stub-if im Caller. Der precheck prüft zusätzlich die
+    # Laufzeit-Invariante (noch kein ai:documented) statt des Trigger-Zeitpunkt-Payloads.
+    # KEIN Fail-open-Arm wie in 01–05: Der Documenter ist die einzige Phase, deren Doppel-Lauf
+    # nicht rückgängig zu machen ist (überschriebener Titel, zweiter Release-Kommentar), während
+    # ein ausgefallener Lauf per workflow_dispatch nachholbar ist. Bricht der precheck ab,
+    # bleibt die Doku bewusst aus.
+    if: needs.precheck.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      PR: ${{ inputs.pr-number }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Startzeit merken (für weiches Zeitlimit)
+        id: starttime
+        run: |
+          now=$(date +%s)
+          echo "epoch=$now" >> "$GITHUB_OUTPUT"
+          echo "soft_deadline_epoch=$((now + 600))" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Claude Code (mit Memory-Load)
+        id: setup
+        uses: deleonio/agent-pipeline/.github/actions/setup-claude@v1.0
+        with:
+          needs-mcp: false
+          tools-tier: review
+          # github.event_name ist caller-assoziert: im Callee liefert es das Trigger-Event des
+          # Stub-Runs ('pull_request' beim closed-Event, 'workflow_dispatch' beim Catch-up) —
+          # exakt das Quellverhalten, konsistent mit den Phasen-Callees 01–06.
+          event-type: ${{ github.event_name }}
+          ticket-ref: ${{ inputs.pr-number }}
+          app-id: ${{ secrets.APP_ID }}
+          app-private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          llm-provider: ${{ vars.LLM_PROVIDER }}
+          model: ${{ vars.CLAUDE_MODEL_DOCUMENTATION || 'haiku' }}
+          zai-api-key: ${{ secrets.ZAI_API_KEY }}
+          claude-api-key: ${{ secrets.CLAUDE_API_KEY }}
+          openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
+          zai-settings-json: ${{ vars.CLAUDE_CODE_SETTINGS_LOCAL_ZAI }}
+          openrouter-settings-json: ${{ vars.CLAUDE_CODE_SETTINGS_LOCAL_OPENROUTER }}
+          tailscale-authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          tailscale-exit-node: ${{ vars.TAILSCALE_EXIT_NODE }}
+          memory-load: 'true'
+          expect-memory: 'true'
+
+      - name: agent-pipeline Version
+        if: steps.setup.outputs.configured == 'true'
+        env:
+          PIPELINE_SHA: ${{ steps.setup.outputs.pipeline-sha }}
+        run: |
+          echo "::notice title=agent-pipeline::Ref v1.0${PIPELINE_SHA:+ @ ${PIPELINE_SHA:0:12}}"
+          echo "- agent-pipeline: v1.0${PIPELINE_SHA:+ @ ${PIPELINE_SHA:0:12}}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 🔧 Phase 0 - Labels sicherstellen (deterministisch, vor Claude)
+        # gh pr edit --add-label bricht hart ab ("X not found"), wenn ein Label im Repo fehlt.
+        # Deshalb hier idempotent alle Labels anlegen, die Claude setzen kann: ai:documented +
+        # die fünf release:* + release:ignore. create_label überspringt vorhandene; schlägt der
+        # List-Abruf fehl (transienter gh-Ausfall), wird nicht angelegt statt zu crashen.
+        # Bleibt deterministischer Bash-Helper — NICHT im LLM-Prompt.
+        id: labels
+        if: steps.setup.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+        run: |
+          set -euo pipefail
+
+          if existing="$(gh label list --repo "$REPO" --json name | jq -r '.[].name')"; then
+            fetch_ok=1
+          else
+            existing=""
+            fetch_ok=0
+            echo "⚠️ Label-Liste nicht abrufbar — überspringe Erstellung (idempotent, kein Crash)."
+          fi
+          create_label() {
+            local name="$1" color="$2" desc="$3"
+            if [ "$fetch_ok" = "0" ]; then
+              echo "⏭️ Label '$name': Abruf war nicht autoritativ, überspringe Erstellung."
+              return 0
+            elif grep -qx "$name" <<<"$existing"; then
+              echo "✅ Label '$name' existiert bereits"
+            else
+              echo "📝 Erstelle Label '$name'..."
+              gh label create "$name" --repo "$REPO" --color "$color" --description "$desc"
+            fi
+          }
+          create_label "ai:documented" 0075ca "Automatically documented by AI"
+          create_label "release:feature" a2eeef "New feature"
+          create_label "release:fix" d73a4a "Bug fix"
+          create_label "release:improvement" a2eeef "Improvement"
+          create_label "release:breaking-change" b60205 "Breaking change"
+          create_label "release:engineering" cfd3d7 "Internal (no release note)"
+          create_label "release:ignore" cfd3d7 "Ignored by release pipeline"
+
+      - name: 🔍 PR-Fakten deterministisch erheben
+        # Bot-Erkennung + Conventional-Commits-Titelprüfung sind Regel-Logik, kein LLM-Job
+        # (s. .agent-pipeline/.github/scripts/pr-doc-facts.sh). Fail-open: bei facts_ok=false laufen Shortcut
+        # und Claude-Pfad normal (Bot-PRs fielen dann notfalls nur in die Engineering-Kategorie,
+        # das release.yml schließt Bot-Autoren zusätzlich per exclude.authors aus).
+        id: facts
+        if: steps.setup.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+        run: |
+          bash .agent-pipeline/.github/scripts/pr-doc-facts.sh --repo "$REPO" --pr "$PR" >> "$GITHUB_OUTPUT"
+
+      - name: ⏭️ Bot-/Ignore-Kurzschluss (deterministisch, ohne LLM)
+        # Dependency-Bot-PRs (Renovate/Dependabot) und bereits als release:ignore markierte PRs:
+        # nur Labels setzen, den kompletten LLM-Lauf (Setup, Diff-Analyse, Rendering) überspringen.
+        # ai:documented sichert hier die Idempotenz-Invariante, release:ignore nur im Bot-Fall —
+        # ein vorhandenes release:ignore wird nicht erweitert/umgedeutet.
+        id: shortcut
+        if: steps.setup.outputs.configured == 'true' && (steps.facts.outputs.bot_skip == 'true' || steps.facts.outputs.already_ignored == 'true')
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+        run: |
+          if [ "${{ steps.facts.outputs.bot_skip }}" = "true" ]; then
+            gh pr edit "$PR" --repo "$REPO" --add-label release:ignore
+            echo "skip_reason=dependency-bot" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip_reason=release-ignore" >> "$GITHUB_OUTPUT"
+          fi
+          gh pr edit "$PR" --repo "$REPO" --add-label ai:documented
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+          echo "::notice title=⏭️ Documenter übersprungen::PR #$PR — Shortcut (${{ steps.facts.outputs.bot_skip == 'true' && 'dependency-bot' || 'release:ignore' }}), nur Labels gesetzt."
+
+      - name: 📝 PR-Analyse via Claude (schreibt nur /tmp/doc.json)
+        id: claude
+        if: steps.setup.outputs.configured == 'true' && steps.shortcut.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          PR: ${{ inputs.pr-number }}
+        run: |
+          # Prompt-Override-Muster (lokale Konsumenten-Datei gewinnt): Prompt liegt kanonisch
+          # in .agent-pipeline/.github/prompts/ (setup-claude checkt das Pipeline-Repo dorthin
+          # aus; Quelle fuer CI + lokale Inspektion, analog spec.md in Phase 3). Eine LOKALE
+          # Konsumenten-Datei .github/prompts/<name>.md überschreibt die gepinnte Version. Kein
+          # Inline-Heredoc mehr: der Vertrag (doc.json-Schema, Mapping-Regeln) ist damit
+          # reviewbar ohne Workflow-Diff.
+          DOCUMENTER_PROMPT=".github/prompts/documenter.md"
+          [ -f "$DOCUMENTER_PROMPT" ] || DOCUMENTER_PROMPT=".agent-pipeline/.github/prompts/documenter.md"
+          MEMORY_READ=".github/prompts/memory-read.md"
+          [ -f "$MEMORY_READ" ] || MEMORY_READ=".agent-pipeline/.github/prompts/memory-read.md"
+
+          {
+            echo 'HINWEIS: Documenter ist terminal + Review-Tier — du schreibst KEINEN Memory (nur Lesen). Lesedetails siehe Memory-Abschnitt am Prompt-Ende.'
+            echo
+            cat "$DOCUMENTER_PROMPT"
+            cat "$MEMORY_READ"
+          } > /tmp/claude-prompt.txt
+
+          # Fakten aus dem Facts-Schritt injizieren (Werte sind sichere Token: true/false,
+          # Zahlen, Scope-Wörter). Fehlende Fakten (facts_ok=false) => Fallback-Defaults.
+          sed -i "s/#PR_NR/$PR/g" /tmp/claude-prompt.txt
+          sed -i "s/TITLE_OK/${{ steps.facts.outputs.title_ok || 'unbekannt' }}/g" /tmp/claude-prompt.txt
+          sed -i "s/SUGGESTED_TYPE/${{ steps.facts.outputs.suggested_type || 'chore' }}/g" /tmp/claude-prompt.txt
+          sed -i "s/SUGGESTED_SCOPE/${{ steps.facts.outputs.suggested_scope || 'k.A.' }}/g" /tmp/claude-prompt.txt
+          sed -i "s/LINKED_ISSUES/${{ steps.facts.outputs.linked_issues || 'keine' }}/g" /tmp/claude-prompt.txt
+          sed -i "s/#MEMORY_STATUS/${{ steps.setup.outputs.memory-status-text }}/g" /tmp/claude-prompt.txt
+          sed -i "s/SOFT_DEADLINE/${{ steps.starttime.outputs.soft_deadline_epoch }}/g" /tmp/claude-prompt.txt
+
+          rm -f /tmp/doc.json
+          ${{ steps.setup.outputs.invoke-cmd }} "$(cat /tmp/claude-prompt.txt)" \
+            ${{ steps.setup.outputs.invoke-args }} \
+            2>&1 | tee /tmp/claude-output.log
+          test "${PIPESTATUS[0]}" -eq 0 || exit "${PIPESTATUS[0]}"
+
+      - name: 🖨️ Rendern — Titel/Body/Kommentar/Labels deterministisch
+        # Alle Schreibzugriffe in einem Schritt: Titel-Rename, Body-Marker-Splice, GENAU EIN
+        # ai-documenter-Kommentar (PATCH statt Duplikat), Labels (ai:documented zuletzt).
+        # Läuft BEWUSST auch bei fehlgeschlagenem/abwesendem Claude-Schritt: das Skript hat
+        # einen Fallback-Pfad (Minimal-Kommentar + ai:documented + release:engineering), denn
+        # der fail-closed-Precheck macht einen Re-Run nach gesetztem ai:documented unmöglich —
+        # ein roter Job ohne Fallback wäre eine Sackgasse.
+        id: render
+        if: always() && steps.setup.outputs.configured == 'true' && steps.shortcut.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+        run: |
+          bash .agent-pipeline/.github/scripts/pr-doc-render.sh --repo "$REPO" --pr "$PR" --doc /tmp/doc.json
+
+      # Kein Memory-Save (im Gegensatz zu 01-05): der Documenter ist terminal, der nachfolgende
+      # Teardown (🧹 Issue-Memory abbau) löscht die Memory-Artefakte ohnehin. Ein Save wäre save-then-delete
+      # (redundant). Der Documenter ist terminal - Persistenz hat keine Folge-Phase mehr.
+
+      - name: 🏷️ Label-Post-Assertion (ai:documented muss am PR hängen)
+        # Erfolgskriterium des Documenter ist nicht ein Review-Verdict, sondern dass ai:documented
+        # am PR hängt. Fehlt es (auch nach Retry für API-Replikationsverzögerung) → harter Fehler:
+        # Claude hat vermutlich nicht gearbeitet. release:* bleibt best-effort (|| true).
+        # Ohne steps.claude.outcome-Klausel: die Assertion deckt auch den Bot-SHORTCUT-Pfad ab,
+        # in dem ai:documented deterministisch ohne Claude gesetzt wird.
+        if: always() && steps.setup.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+        run: |
+          documented="false"
+          for attempt in 1 2 3 4; do
+            if gh pr view "$PR" --repo "$REPO" --json labels \
+              --jq '[.labels[].name] | any(. == "ai:documented")' 2>/dev/null | grep -q true; then
+              documented="true"
+              break
+            fi
+            [ "$attempt" -lt 4 ] && sleep "$attempt"
+          done
+          if [ "$documented" != "true" ]; then
+            echo "::error title=❌ Documenter ohne ai:documented::PR #$PR hat nach Claudes Lauf kein ai:documented-Label — Claude hat vermutlich nicht gearbeitet."
+            exit 1
+          fi
+          echo "::notice title=✅ Dokumentation abgeschlossen::PR #$PR — ai:documented gesetzt."
+
+      - name: 🧹 Issue-Memory abbauen (deterministisch)
+        # Claude pflegt seinen nativen Memory nach .claude/memory/ (autoMemoryDirectory), pro Issue
+        # persistiert als ARTEFAKT claude-memory-issue-{N} (s. setup-claude, memory-save-key).
+        # Nach Merge ist dieser Memory stale -> abbauen. Issue-Auflösung wie setup-claude: Closing-Issue,
+        # sonst PR-Nummer als Fallback. Best-Effort: ein fehlgeschlagener Delete darf den Lauf nicht
+        # abbrechen (retention-days: 14 ist der Backstop).
+        # NUR bei Job-Erfolg (kein always()): schlägt der Documenter fehl, bleibt der Memory für den
+        # Re-Run erhalten — always() würde die Vor-Phasen-Notizen vor dem Retry wegputzen.
+        #
+        # Räumt ARTEFAKTE, nicht Caches: der Cache war nie der Speicher (Cache-Writes sind für
+        # diese Trigger platform-seitig gesperrt, s. setup-claude Kopf-Kommentar), dieser Schritt
+        # lief also bisher wirkungslos gegen eine leere Liste.
+        if: steps.setup.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+        run: |
+          closing_issue="$(gh pr view "$PR" --repo "$REPO" --json closingIssuesReferences \
+            --jq '[.closingIssuesReferences[].number] | first' 2>/dev/null || true)"
+          for ref in "$closing_issue" "$PR"; do
+            if [ -z "$ref" ] || [ "$ref" = "null" ]; then continue; fi
+            while IFS= read -r aid; do
+              [ -z "$aid" ] && continue
+              gh api -X DELETE "repos/$REPO/actions/artifacts/$aid" 2>/dev/null \
+                && echo "🗑️ Memory-Artefakt $aid gelöscht" || true
+            done < <(gh api "repos/$REPO/actions/artifacts?name=claude-memory-issue-${ref}&per_page=100" \
+              --jq '.artifacts[] | select(.expired == false) | .id' 2>/dev/null || true)
+          done
+          exit 0
+
+      - name: 📋 Ergebnis zusammenfassen
+        if: always() && steps.setup.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          OUTCOME: ${{ steps.claude.outcome }}
+          RENDER_OUTCOME: ${{ steps.render.outcome }}
+          SKIP_REASON: ${{ steps.shortcut.outputs.skip_reason }}
+        run: |
+          labels="$(gh pr view "$PR" --repo "$REPO" --json labels --jq '[.labels[].name] | join(", ")' 2>/dev/null || true)"
+          if [ -n "$SKIP_REASON" ]; then
+            echo "::notice title=✅ Documenter übersprungen::PR #$PR — $SKIP_REASON (nur Labels, kein LLM-Lauf)."
+          elif [ "$RENDER_OUTCOME" = "success" ]; then
+            echo "::notice title=✅ Documenter erfolgreich::PR #$PR"
+          elif [ "$OUTCOME" = "cancelled" ] || [ "$RENDER_OUTCOME" = "cancelled" ]; then
+            echo "::warning title=⏸️ Documenter abgebrochen::PR #$PR"
+          else
+            echo "::error title=❌ Documenter fehlgeschlagen::PR #$PR"
+          fi
+          {
+            echo "### PR-Documenter #$PR"
+            if [ -n "$SKIP_REASON" ]; then
+              echo "- Shortcut: \`${SKIP_REASON}\` (kein LLM-Lauf)"
+            else
+              echo "- Claude-Schritt: \`${OUTCOME:-unbekannt}\`"
+              echo "- Render-Schritt: \`${RENDER_OUTCOME:-unbekannt}\`"
+            fi
+            echo "- Labels: ${labels:-keine}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 🩺 Z.AI Fair-Usage-Check (1313)
+        # Rohausgabe des Claude-Laufs auf z.ai-Fehler 1313 (Fair Usage) durchsuchen
+        # und Ergebnis als Annotation + Job-Summary sichtbar machen.
+        if: always()
+        uses: deleonio/agent-pipeline/.github/actions/llm-fair-usage-check@v1.0

@@ -1,0 +1,364 @@
+# Callee (workflow_call) der Phase 1/7 Triage (Quelle: 01-claude-triage.yml) — aufgerufen vom
+# Stub stubs/01-claude-triage.yml im Konsumenten-Repo via
+# `uses: deleonio/agent-pipeline/.github/workflows/triage.yml@v1.0`.
+# Event-Fakten-Filter (opened/unlabeled + author_association) und concurrency (queue: max)
+# leben im Stub. Hinweis: Stub-Name/Dateiname ist Vertrag (gate-merge/Sweep matchen sie).
+
+name: 1/7 Analyse (Callee)
+
+on:
+  workflow_call:
+    inputs:
+      issue-number:
+        description: 'Issue-Nummer (github.event.issue.number, vom Stub durchgereicht)'
+        required: true
+        type: string
+      trigger-label:
+        description: 'Label aus dem Trigger-Event (github.event.label.name); leer bei opened - die Action prueft dann ai:analyzed'
+        required: false
+        default: ''
+        type: string
+      skip-ux:
+        description: 'true = ux:ready in der Post-Assertion auch ohne UI-Bezug=nein setzen (Repos ohne eigene UX-Phase)'
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      APP_ID:
+        required: false
+      APP_PRIVATE_KEY:
+        required: false
+      ZAI_API_KEY:
+        required: false
+      CLAUDE_API_KEY:
+        required: false
+      OPENROUTER_API_KEY:
+        required: false
+      TAILSCALE_AUTH_KEY:
+        required: false
+
+jobs:
+  precheck:
+    # [Konvertierung: Das Event-if (opened+author_association ODER unlabeled+Label) ist als
+    #  job-if in den Stub gewandert — dieser precheck läuft im Callee immer.]
+    #
+    # Label-IST-Zustand zur Laufzeit abfragen (nicht den Trigger-Zeitpunkt-Payload): Dieser Run
+    # kann lange in der globalen Phasen-Queue warten — bis er startet, kann das Token-Label
+    # (ai:analyzed bzw. ai:to-big-issue) bereits von einem anderen Lauf gesetzt worden sein.
+    # Soll-Werte stehen zentral in .github/scripts/check-phase-label.sh; hier wird nur der
+    # Phasen-Name übergeben. Fail-open bei API-Fehler (dort implementiert).
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read # Checkout des Konsumenten-Repos (war: lokale Action + Skript; Action liegt jetzt zentral)
+      issues: read
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Label-Pre-Check (IST-Zustand zur Laufzeit)
+        id: check
+        uses: deleonio/agent-pipeline/.github/actions/check-phase-label@v1.0
+        with:
+          phase: analyse
+          ticket: ${{ inputs.issue-number }}
+          # Beim Re-Triage (unlabeled) muss GENAU das entfernte Label abwesend bleiben;
+          # bei `opened` ist der Wert leer und die Action prüft ai:analyzed.
+          trigger-label: ${{ inputs.trigger-label }}
+
+  triage:
+    needs: precheck
+    # `result == 'failure'` ist FAIL-OPEN und beabsichtigt: das Skript fällt bei API-Fehlern
+    # bewusst auf "laufen lassen" zurück, aber ein Fehler AUSSERHALB (Checkout, Timeout,
+    # Runner-Ausfall) würde den Hauptjob sonst stumm überspringen — Trigger konsumiert, niemand
+    # arbeitet, nichts re-armt. Ein übersprungener precheck (result == 'skipped', No-op-Trigger)
+    # erfüllt keine der beiden Klauseln und lässt den Hauptjob korrekt entfallen.
+    # [Konvertierung: Der No-op-Skip passiert jetzt bereits im Stub-if; die Klausel bleibt
+    #  als Schutz erhalten.]
+    if: >-
+      ${{ always()
+          && (needs.precheck.outputs.proceed == 'true' || needs.precheck.result == 'failure') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    permissions:
+      contents: read
+      issues: write
+      id-token: write
+      pull-requests: write
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Startzeit merken (für weiches Zeitlimit)
+        id: starttime
+        run: |
+          now=$(date +%s)
+          echo "epoch=$now" >> "$GITHUB_OUTPUT"
+          echo "soft_deadline_epoch=$((now + 600))" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Claude Code (mit Memory-Load)
+        id: setup
+        uses: deleonio/agent-pipeline/.github/actions/setup-claude@v1.0
+        with:
+          needs-mcp: true
+          tools-tier: restricted
+          event-type: ${{ github.event_name }}
+          ticket-ref: ${{ inputs.issue-number }}
+          app-id: ${{ secrets.APP_ID }}
+          app-private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          llm-provider: ${{ vars.LLM_PROVIDER }}
+          model: ${{ vars.CLAUDE_MODEL_TRIAGE || 'fable' }}
+          zai-api-key: ${{ secrets.ZAI_API_KEY }}
+          claude-api-key: ${{ secrets.CLAUDE_API_KEY }}
+          openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
+          zai-settings-json: ${{ vars.CLAUDE_CODE_SETTINGS_LOCAL_ZAI }}
+          openrouter-settings-json: ${{ vars.CLAUDE_CODE_SETTINGS_LOCAL_OPENROUTER }}
+          tailscale-authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          tailscale-exit-node: ${{ vars.TAILSCALE_EXIT_NODE }}
+          # Memory laden: Erst-Triage findet kein Artefakt (Start von null = Normalfall),
+          # Re-Triage restauriert den bisherigen Ticket-Memory als Kontext und nutzt ihn.
+          # expect-memory=false: leeres Memory bleibt der Normalfall (keine Warning trotz Load).
+          memory-load: 'true'
+          expect-memory: 'false'
+
+      - name: agent-pipeline Version
+        if: steps.setup.outputs.configured == 'true'
+        env:
+          PIPELINE_SHA: ${{ steps.setup.outputs.pipeline-sha }}
+        run: |
+          echo "::notice title=agent-pipeline::Ref v1.0${PIPELINE_SHA:+ @ ${PIPELINE_SHA:0:12}}"
+          echo "- agent-pipeline: v1.0${PIPELINE_SHA:+ @ ${PIPELINE_SHA:0:12}}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Triage via Claude
+        id: claude
+        if: steps.setup.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          ISSUE: ${{ inputs.issue-number }}
+        run: |
+          cat > /tmp/claude-prompt.txt << 'CLAUDE_EOF'
+          FOKUS: NUR Issue #ISSUE_NR. Recherche = Issue-Body + ggf. Delta-Kommentare seit stand, sonst nichts. KEINE Abstecher. Token sparen: kurz, präzise, direkt.
+
+          TRIGGER:
+            - Erst-Triage: Kein <!-- KI-ANALYSE:START --> Block im Issue-Body.
+            - Re-Triage: Block existiert. Lese NUR Delta-Kommentare seit stand-Timestamp:
+              gh issue view #ISSUE_NR --json comments --jq '.comments[] | select(.createdAt > "<stand>")'
+
+          ABLAUF (STRIKT):
+            0. ZIEL-ANKER: ZUERST gh issue view #ISSUE_NR --json title,body lesen. Die Analyse gilt
+               AUSSCHLIESSLICH Issue #ISSUE_NR — Nummern aus Memory, Issue-Referenzen oder ähnlichen
+               Issues sind KEIN Analyseziel (Incident 13.08.: Triage von #596 analysierte stattdessen #560).
+               Vor der VERDICT-Zeile ausgeben: "Triage von Issue #ISSUE_NR: <exakter Titel>".
+            1. SOFORT starten.
+            2. Titel prüfen: Konsistenz zur Beschreibung? Falls nein: inhaltlich treu optimieren (gh issue edit --title).
+            3. Beschreibung lektorieren (Form verbessern, Inhalt unverändert, gh issue edit --body-file -).
+            4. Zu große Tickets ZERLEGEN, wenn mind. EINES zutrifft: mehrere Schichten/Pakete (z. B. Frontend+Backend+DB) ODER mehrere unabhängige AK ODER nicht sinnvoll in 1 PR machbar. Dann in 2–5 Sub-Issues (max. 1 Ebene, max. 5), jede in 1 PR umsetzbar. Pro Sub-Issue:
+               a) VORAB Labels sicherstellen (sonst schlägt --label fehl): gh label create "ai:analyzed" --color 0E8A16 2>/dev/null||true; gh label create "ai:spec-ready" --color FBCA04 2>/dev/null||true; gh label create "ux:ready" --color 0E8A16 2>/dev/null||true
+               b) Sub-Issue anlegen — Body: "Teil von #ISSUE_NR" + Mini-Analyse MIT MARKERN
+                  (<!-- KI-ANALYSE:START stand=<ISO-8601> --> … <!-- KI-ANALYSE:END -->, exakt
+                  BODY-BLOCK-FORMAT — PFLICHT auch für Sub-Issues: Re-Triage/Unblock prüft den Block,
+                  ohne Marker failt der Workflow hart): gh issue create --title "<Teilaufgabe>" --label "ai:analyzed" --body-file - <<'EOF' … EOF
+               c) Als echtes GitHub-Sub-Issue ans Eltern-Ticket hängen (PFLICHT, nicht nur Textreferenz): gh api graphql -f query='mutation($p:ID!,$c:ID!){addSubIssue(input:{issueId:$p,subIssueId:$c}){clientMutationId}}' -f p="$(gh issue view #ISSUE_NR --json id -q .id)" -f c="$(gh issue view <SUB-NR> --json id -q .id)"
+               d) Sequenzielle Abhängigkeit (A1→A2→A3, gleiche Dateien/„A2 nach A1"): Vorgänger blockt Nachfolger — PFLICHT, maschinenlesbar (issue-unblock.yml löst beim Merge des Vorgängers automatisch auf): gh api graphql -f query='mutation($b:ID!,$k:ID!){addBlockedBy(input:{issueId:$b,blockingIssueId:$k}){clientMutationId}}' -f b="$(gh issue view <NACHFOLGER-NR> --json id -q .id)" -f k="$(gh issue view <VORGÄNGER-NR> --json id -q .id)" — Kanten gedrosselt setzen (sekundäres Rate-Limit bei zu schnellen Schreibzugriffen). Nur echte Reihenfolge-Abhängigkeiten; unabhängige Sub-Issues bleiben ohne blocked-by.
+               e) Nur der ERSTE unblockierte Sub-Issue bekommt ai:spec-ready (gh issue edit <SUB-NR> --add-label "ai:spec-ready"); enthält der Mini-Analyse-Block des Sub-Issues „UI-Bezug: nein", zusätzlich ux:ready setzen (gh issue edit <SUB-NR> --add-label "ux:ready") — das überspringt die UX-Phase für Nicht-UI-Sub-Issues wie beim Eltern-Ticket. Geblockte Nachfolger bleiben ai:analyzed und werden beim Merge des Vorgängers automatisch freigegeben. Unabhängige Sub-Issues folgen ihrer eigenen Ampel.
+               Sub-Issues sind durch ai:analyzed beim Anlegen vor Re-Triage geschützt (nicht erneut zerlegen — Rekursionsschutz). Eltern-Issue nach Zerlegung → VERDICT: analyzed (nur Tracker, nicht direkt umsetzbar).
+            5. Analyse schreiben: Akzeptanzkriterien + Testfälle + Ampel (🟢/🟡/🔴) in den BODY-BLOCK.
+               ⚠️ ZWINGEND: Der BODY-BLOCK gehört in den Issue-BODY via `gh issue edit --body-file -` (vorhandenen Body erhalten + Block anhängen), NIEMALS als Kommentar. Der Workflow prüft den Body — ein Block nur im Kommentar lässt den Lauf scheitern (bzw. wird nur als Notfall-Migration akzeptiert).
+            6. EINEN Ping-Kommentar (gh issue comment) — nur eine kurze Notiz (z. B. "spec-ready, nach #VORGÄNGER umsetzbar"), OHNE den KI-ANALYSE-Block.
+
+          BODY-BLOCK-FORMAT:
+            <!-- KI-ANALYSE:START stand=<ISO-8601-Datum> -->
+            ### UI-Bezug
+            - UI-Bezug: ja|nein
+            - Begründung: [Kurzbegründung]
+
+            [Analyse – präzise, ohne Füllwörter]
+            <!-- KI-ANALYSE:END -->
+
+          ⚠️ LABELS: KEINE Labels aufs ELTERN-Issue #ISSUE_NR setzen — der Workflow übernimmt das via VERDICT. Ausnahme Zerlegung (Schritt 4): neu angelegte SUB-Issues werden direkt beim Anlegen mit ai:analyzed (bzw. ai:spec-ready) gelabelt, weil der Workflow nur das Eltern-Issue verwaltet.
+
+          VERDICT: GANZ AM ENDE GENAU EINE Zeile:
+            - VERDICT: spec-ready (bei 🟢 — Issue direkt umsetzbar, NICHT zerlegt)
+            - VERDICT: analyzed (bei 🟡/🔴 ODER nach Zerlegung in Sub-Issues — Eltern-Issue ist nur Tracker)
+
+          ZEITLIMIT: Soft-Deadline = SOFT_DEADLINE. Vor jedem Schritt: [ $(date +%s) -ge SOFT_DEADLINE ]. Bei OVER: Body-Block sichern, Turn beenden.
+          CLAUDE_EOF
+
+          # Memory-Snippets anhängen (Read + Write: Erst-Triage startet mit leerem Memory,
+          # Re-Triage setzt anhand des restaurierten Standes fort; vor den seds, damit
+          # #ISSUE_NR/#PHASE/#MEMORY_STATUS mit substituiert werden).
+          # Override-Muster: lokale Konsumenten-Datei gewinnt, Fallback zentral (.agent-pipeline).
+          PROMPT=".github/prompts/memory-read.md"
+          [ -f "$PROMPT" ] || PROMPT=".agent-pipeline/.github/prompts/memory-read.md"
+          cat "$PROMPT" >> /tmp/claude-prompt.txt
+          PROMPT=".github/prompts/memory-write.md"
+          [ -f "$PROMPT" ] || PROMPT=".agent-pipeline/.github/prompts/memory-write.md"
+          cat "$PROMPT" >> /tmp/claude-prompt.txt
+
+          sed -i "s/#ISSUE_NR/${{ inputs.issue-number }}/g" /tmp/claude-prompt.txt
+          sed -i "s/#PHASE/triage/g" /tmp/claude-prompt.txt
+          sed -i "s/#MEMORY_STATUS/${{ steps.setup.outputs.memory-status-text }}/g" /tmp/claude-prompt.txt
+          sed -i "s/SOFT_DEADLINE/${{ steps.starttime.outputs.soft_deadline_epoch }}/g" /tmp/claude-prompt.txt
+
+          ${{ steps.setup.outputs.invoke-cmd }} "$(cat /tmp/claude-prompt.txt)" \
+            ${{ steps.setup.outputs.invoke-args }} \
+            2>&1 | tee /tmp/claude-output.log
+          test "${PIPESTATUS[0]}" -eq 0 || exit "${PIPESTATUS[0]}"
+
+      - name: Memory-Upload (das Artefakt IST der Speicher der Phasen-Notizen)
+        # Kein Cache-Save mehr — er ist für diese Pipeline platform-seitig unmöglich: GitHubs
+        # Richtlinie vom 2026-06-26 vergibt für Issue-/Label-/PR-Trigger UND die daraus
+        # kaskadierten workflow_run-Läufe nur lese-only Cache-Token. Der frühere Companion
+        # (claude-memory-save.yml) scheiterte deshalb in JEDEM Lauf still mit "cache write
+        # denied: token has no writable scopes" — als ##[warning], also bei grünem Job.
+        # Artefakte unterliegen dieser Restriktion nicht; die Folgephase holt sich das jüngste
+        # nicht-abgelaufene Artefakt dieses Namens (s. setup-claude, Step "Memory-Load").
+        # Name = claude-memory-issue-{N} (steps.setup.outputs.memory-save-key).
+        if: always() && steps.setup.outputs.configured == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.setup.outputs.memory-save-key }}
+          path: ${{ steps.setup.outputs.memory-path }}
+          # 14 Tage: das Artefakt ist jetzt der einzige Speicher, nicht mehr nur ein Transport-
+          # vehikel zum Cache (dort war 1 Tag genug). Muss den ganzen Ticket-Lebenszyklus
+          # überdauern; Phase 7 räumt am Ende ohnehin deterministisch auf. Größe: ~1 KB.
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Label-Post-Assertion (VERDICT parsen, Labels via App-Token force-setzen)
+        if: always() && steps.setup.outputs.configured == 'true' && (steps.claude.outcome == 'success' || steps.claude.outcome == 'failure')
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          ISSUE: ${{ inputs.issue-number }}
+          SKIP_UX: ${{ inputs.skip-ux }}
+        run: |
+          verdict=""
+          LOG=/tmp/claude-output.log
+          if [ -f "$LOG" ]; then
+            # Portabel statt `grep -oP '…\K…'` (\K = Perl-Lookbehind): BSD-grep (macOS
+            # /usr/bin/grep) kennt -P nicht → verdict leer → fälschlich fail-safe „analyzed".
+            # sed -E ist BSD wie GNU portabel (CI: GNU-grep; macOS Manuell-Test: BSD-grep).
+            # tr -d -c 'A-Za-z0-9-' streift neben Whitespaces auch Markdown-Dekoration (**…**,
+            # Backticks), die Claude gern ums VERDICT legt — sonst wird "spec-ready**" != "spec-ready"
+            # und der Vergleich fällt fälschlich auf fail-safe (Issue #582). A-Za-z0-9- deckt alle
+            # gültigen Verdicts (spec-ready, analyzed); Complement-Delete ist BSD wie GNU portabel.
+            verdict="$(grep 'VERDICT:' "$LOG" | tail -1 | sed -E 's/^.*VERDICT:[[:space:]]*//' | tr -d -c 'A-Za-z0-9-' || true)"
+          fi
+          echo "Claude-Verdict aus Output: '${verdict:-keins}'"
+
+          BODY="$(gh issue view "$ISSUE" --repo "$GITHUB_REPOSITORY" --json body -q .body 2>/dev/null || true)"
+          HAS_BLOCK="false"
+          HAS_AK="false"
+          if printf '%s' "$BODY" | grep -q "KI-ANALYSE:START"; then
+            HAS_BLOCK="true"
+            if printf '%s' "$BODY" | grep -qiE "Akzeptanzkriterien|AK[[:space:]]*[0-9]"; then
+              HAS_AK="true"
+            fi
+
+            # UI-Bezug aus KI-ANALYSE-Block parsen (für ux:ready-Management)
+            UI_BEZUG=""
+            UI_BEZUG_LINE="$(printf '%s' "$BODY" | grep -iE "UI-Bezug:" | head -1 || true)"
+            if [ -n "$UI_BEZUG_LINE" ]; then
+              UI_BEZUG="$(printf '%s' "$UI_BEZUG_LINE" | sed -E 's/^.*[Uu][Iu][- ]?[Bb]ezug:[[:space:]]*//' | tr -d '[:space:]' | head -c 4 || true)"
+            fi
+            echo "UI-Bezug aus Analyse: '${UI_BEZUG:-nicht gefunden}'"
+          fi
+
+          # Self-Heal (Issue #566): Schwachmodell-Agent (zai/GLM) postet den KI-ANALYSE-Block
+          # gelegentlich als Kommentar, statt ihn via `gh issue edit` in den Body zu schreiben.
+          # Statt dann den kompletten Lauf (und die Token-Spende) wegzuwerfen, den Block aus
+          # dem neuesten passenden Kommentar in den Body migrieren — modellunabhängige
+          # Sicherheitsleine. hart-fail nur, wenn der Block WEDER im Body NOCH in einem
+          # Kommentar existiert.
+          if [ "$HAS_BLOCK" != "true" ]; then
+            BLOCK_FROM_COMMENT="$(gh issue view "$ISSUE" --repo "$GITHUB_REPOSITORY" --json comments -q \
+              '[.comments[] | select(.body | test("KI-ANALYSE:START"))] | last | .body // ""' 2>/dev/null || true)"
+            if [ -n "$BLOCK_FROM_COMMENT" ]; then
+              printf '%s\n\n%s\n' "$BODY" "$BLOCK_FROM_COMMENT" \
+                | gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --body-file - 2>/dev/null || true
+              echo "::warning title=♻️ Block migriert::KI-ANALYSE-Block war in einem Kommentar statt im Issue-Body – automatisch in den Body migriert."
+              BODY="$(gh issue view "$ISSUE" --repo "$GITHUB_REPOSITORY" --json body -q .body 2>/dev/null || true)"
+              HAS_BLOCK="true"
+              if printf '%s' "$BODY" | grep -qiE "Akzeptanzkriterien|AK[[:space:]]*[0-9]"; then
+                HAS_AK="true"
+              fi
+            fi
+          fi
+
+          if [ "$HAS_BLOCK" != "true" ]; then
+            echo "::error title=❌ Analyse fehlt::Kein KI-ANALYSE-Block im Issue-Body ODER in Kommentaren. Lauf muss wiederholt werden."
+            exit 1
+          fi
+
+          # VERDICT ist autoritativ für die Phasen-Freigabe (Issue #538):
+          #   spec-ready (🟢) + AK vorhanden → Freigabe in die Spec-Stufe
+          #   analyzed (🟡/🔴) oder leer/ungültig → beim Menschen bleiben (fail-safe)
+          # HAS_AK wirkt nur als zusätzlicher Guard, nie als alleiniger Promoter.
+          if [ "$verdict" = "spec-ready" ] && [ "$HAS_AK" = "true" ]; then
+            final="spec-ready"
+          else
+            final="analyzed"
+          fi
+
+          gh label create "ai:analyzed" --color 0E8A16 2>/dev/null || true
+          gh label create "ai:spec-ready" --color FBCA04 2>/dev/null || true
+          gh label create "ux:ready" --color 0E8A16 2>/dev/null || true
+
+          gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --remove-label "ai:analyzed" 2>/dev/null || true
+          gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --add-label "ai:analyzed"
+
+          # Post-Assertion für ux:ready (Issue #734): IMMER entfernen, bei spec-ready + UI-Bezug: nein setzen
+          gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --remove-label "ux:ready" 2>/dev/null || true
+
+          if [ "$final" = "spec-ready" ]; then
+            gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --remove-label "ai:spec-ready" 2>/dev/null || true
+            gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --add-label "ai:spec-ready"
+            # Bei Nicht-UI-Tickets (UI-Bezug: nein) direkt ux:ready setzen — ODER wenn der
+            # Konsument skip-ux=true übergibt (Repos ohne eigene UX-Phase): ux:ready ist die
+            # Pflicht-Eingabe der Spec-Phase, ohne sie stoppt die Kette nach der Triage.
+            if [ "$UI_BEZUG" = "nein" ] || [ "$SKIP_UX" = "true" ]; then
+              gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --add-label "ux:ready"
+              echo "::notice::Labels gesetzt: ai:analyzed + ai:spec-ready + ux:ready (Nicht-UI-Ticket)"
+            else
+              echo "::notice::Labels gesetzt: ai:analyzed + ai:spec-ready (UI-Ticket – 02 kümmert sich)"
+            fi
+          else
+            gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --remove-label "ai:spec-ready" 2>/dev/null || true
+            gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --remove-label "ai:ready" 2>/dev/null || true
+            echo "::notice::Label gesetzt: ai:analyzed (🟡/🔴)"
+          fi
+
+      - name: Ergebnis zusammenfassen
+        if: always() && steps.setup.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          ISSUE: ${{ inputs.issue-number }}
+          OUTCOME: ${{ steps.claude.outcome }}
+        run: |
+          labels="$(gh issue view "$ISSUE" --repo "$GITHUB_REPOSITORY" --json labels --jq '[.labels[].name] | join(", ")' 2>/dev/null || true)"
+          if [ "$OUTCOME" = "success" ]; then
+            echo "::notice title=✅ Triage erfolgreich::Issue #${ISSUE} vollständig analysiert"
+          elif [ "$OUTCOME" = "cancelled" ]; then
+            echo "::warning title=⏸️ Triage abgebrochen::Lauf durch neueren Trigger verdrängt oder Timeout"
+          else
+            echo "::error title=❌ Triage fehlgeschlagen::Claude-Lauf gescheitert"
+          fi
+          {
+            echo "### (Re-)Triage #${ISSUE} – fertig"
+            echo ""
+            echo "- Claude-Schritt: \`${OUTCOME:-unbekannt}\`"
+            echo "- Aktuelle Labels: ${labels:-keine}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 🩺 Z.AI Fair-Usage-Check (1313)
+        # Rohausgabe des Claude-Laufs auf z.ai-Fehler 1313 (Fair Usage) durchsuchen
+        # und Ergebnis als Annotation + Job-Summary sichtbar machen.
+        if: always()
+        uses: deleonio/agent-pipeline/.github/actions/llm-fair-usage-check@v1.0

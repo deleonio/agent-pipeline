@@ -1,0 +1,377 @@
+# Callee (workflow_call) der Phase 3/7 Spec (Quelle: 03-claude-spec.yml) — aufgerufen vom
+# Stub stubs/03-claude-spec.yml im Konsumenten-Repo via
+# `uses: deleonio/agent-pipeline/.github/workflows/spec.yml@v1.0`.
+# Event-Fakten-Filter (Label ux:ready) und concurrency (queue: max) leben im Stub.
+# Hinweis: Stub-Name/Dateiname ist Vertrag (gate-merge/Sweep matchen sie).
+
+name: 3/7 Spec (Callee)
+
+on:
+  workflow_call:
+    inputs:
+      issue-number:
+        description: 'Issue-Nummer (github.event.issue.number, vom Stub durchgereicht)'
+        required: true
+        type: string
+      node-version-file:
+        description: 'Pfad zur Node-Version-Datei (z. B. .nvmrc); leer = kein Node-Setup'
+        required: false
+        default: ''
+        type: string
+      install-command:
+        description: 'Shell-Befehl fuer das Projekt-Setup (z. B. corepack enable && pnpm install ... && lefthook install); leer = kein Setup'
+        required: false
+        default: ''
+        type: string
+      test-paths:
+        description: 'Leerzeichen-getrennte Pfad-Praefixe fuer das Test-Pfad-Gate der Post-Assertion (z. B. "server/src frontend/src frontend/e2e"); leer = Gate deaktiviert'
+        required: false
+        default: ''
+        type: string
+    secrets:
+      APP_ID:
+        required: false
+      APP_PRIVATE_KEY:
+        required: false
+      ZAI_API_KEY:
+        required: false
+      CLAUDE_API_KEY:
+        required: false
+      OPENROUTER_API_KEY:
+        required: false
+      TAILSCALE_AUTH_KEY:
+        required: false
+
+jobs:
+  precheck:
+    # [Konvertierung: Das Event-if (Label ux:ready) ist als job-if in den Stub gewandert —
+    #  dieser precheck läuft im Callee immer.]
+    #
+    # Label-IST-Zustand zur Laufzeit: ai:spec-ready + ai:analyzed müssen JETZT (nach dem
+    # Warten in der globalen Phasen-Queue) noch am Issue kleben. Soll-Werte stehen zentral
+    # in .github/scripts/check-phase-label.sh; hier wird nur der Phasen-Name übergeben.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read # Checkout des Konsumenten-Repos (war: lokale Action + Skript; Action liegt jetzt zentral)
+      issues: read
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Label-Pre-Check (IST-Zustand zur Laufzeit)
+        id: check
+        uses: deleonio/agent-pipeline/.github/actions/check-phase-label@v1.0
+        with:
+          phase: spec
+          ticket: ${{ inputs.issue-number }}
+
+  spec:
+    needs: precheck
+    # `result == 'failure'` ist FAIL-OPEN und beabsichtigt: das Skript fällt bei API-Fehlern
+    # bewusst auf "laufen lassen" zurück, aber ein Fehler AUSSERHALB (Checkout, Timeout,
+    # Runner-Ausfall) würde den Hauptjob sonst stumm überspringen — Trigger konsumiert, niemand
+    # arbeitet, nichts re-armt. Ein übersprungener precheck (result == 'skipped', No-op-Trigger)
+    # erfüllt keine der beiden Klauseln und lässt den Hauptjob korrekt entfallen.
+    # [Konvertierung: Der No-op-Skip passiert jetzt bereits im Stub-if; die Klausel bleibt
+    #  als Schutz erhalten.]
+    if: >-
+      ${{ always()
+          && (needs.precheck.outputs.proceed == 'true' || needs.precheck.result == 'failure') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    permissions:
+      contents: read
+      id-token: write
+      actions: write
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Startzeit merken (für weiches Zeitlimit)
+        id: starttime
+        run: |
+          now=$(date +%s)
+          echo "epoch=$now" >> "$GITHUB_OUTPUT"
+          echo "soft_deadline_epoch=$((now + 840))" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Claude Code (mit Memory-Load)
+        id: setup
+        uses: deleonio/agent-pipeline/.github/actions/setup-claude@v1.0
+        with:
+          needs-mcp: false
+          tools-tier: full
+          event-type: ${{ github.event_name }}
+          ticket-ref: ${{ inputs.issue-number }}
+          app-id: ${{ secrets.APP_ID }}
+          app-private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          llm-provider: ${{ vars.LLM_PROVIDER }}
+          model: ${{ vars.CLAUDE_MODEL_SPEC || 'sonnet' }}
+          zai-api-key: ${{ secrets.ZAI_API_KEY }}
+          claude-api-key: ${{ secrets.CLAUDE_API_KEY }}
+          openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
+          zai-settings-json: ${{ vars.CLAUDE_CODE_SETTINGS_LOCAL_ZAI }}
+          openrouter-settings-json: ${{ vars.CLAUDE_CODE_SETTINGS_LOCAL_OPENROUTER }}
+          tailscale-authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          tailscale-exit-node: ${{ vars.TAILSCALE_EXIT_NODE }}
+          memory-load: 'true'
+          expect-memory: 'true'
+
+      - name: agent-pipeline Version
+        if: steps.setup.outputs.configured == 'true'
+        env:
+          PIPELINE_SHA: ${{ steps.setup.outputs.pipeline-sha }}
+        run: |
+          echo "::notice title=agent-pipeline::Ref v1.0${PIPELINE_SHA:+ @ ${PIPELINE_SHA:0:12}}"
+          echo "- agent-pipeline: v1.0${PIPELINE_SHA:+ @ ${PIPELINE_SHA:0:12}}" >> "$GITHUB_STEP_SUMMARY"
+
+      # Kein Skip-Guard ("läuft bereits") mehr: Die globale Phasen-Serialisierung (statische
+      # concurrency-Gruppe) lässt Läufe desselben Issues nie parallel laufen, und der precheck
+      # dedupliziert über den Label-IST-Zustand. Ein Lauf-Listen-Guard würde hier nur noch
+      # queued Nachfolger finden und das FALSCHE Skip auslösen.
+
+      - name: Doppel-Run-Guard (ready-PR existiert) + verwaiste Drafts aufräumen
+        id: doppel-guard
+        if: steps.setup.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          ISSUE: ${{ inputs.issue-number }}
+        run: |
+          # Ready-PR (Nicht-Draft) existiert -> Implement schon gelaufen -> skip. Symmetrie zu
+          # 04-claude-implement.yml, dessen Guard ebenfalls nur auf Nicht-Drafts prueft. Ein Draft
+          # allein ist KEIN Skip-Grund: er stammt von einem abgebrochenen Spec-Lauf und wuerde
+          # die Issue sonst dauerhaft blockieren (G5).
+          # Ready-PR = nicht-draft PR zu diesem Issue. Helper probiert primär
+          # closingIssuesReferences und fällt bei fehlendem "#" ("Closes NNN") auf
+          # Body-Suche zurück. schluckt gh-Fehler intern (→ 0), fail-open bleibt erhalten.
+          ready="$(bash .agent-pipeline/.github/scripts/pr-for-issue.sh --repo "$GITHUB_REPOSITORY" \
+            --issue "$ISSUE" --draft no --out count)"
+          if [ "${ready:-0}" -gt 0 ]; then
+            echo "::notice::Spec übersprungen – ready-PR (Nicht-Draft) existiert bereits für Issue #$ISSUE."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Verwaiste Draft-PRs schliessen (Best-Effort, Branch bleibt erhalten), damit beim
+          # Neu-Anstoß kein zweiter Draft neben dem alten akkumuliert.
+          orphans="$(bash .agent-pipeline/.github/scripts/pr-for-issue.sh --repo "$GITHUB_REPOSITORY" \
+            --issue "$ISSUE" --draft yes --out all)"
+          for pr in $orphans; do
+              [ -n "$pr" ] || continue
+              gh pr close "$pr" --repo "$GITHUB_REPOSITORY" \
+                --comment "🔄 Spec für Issue #$ISSUE neu angestoßen – verwaister Draft geschlossen (Branch bleibt erhalten)." 2>/dev/null || true
+              echo "::notice::Verwaisten Draft-PR #$pr für Issue #$ISSUE geschlossen."
+            done
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      # Ersetzt die Quell-Steps pnpm/action-setup + setup-node(.nvmrc, cache: pnpm) +
+      # pnpm install --frozen-lockfile + lefthook install — konfiguriert via Stub
+      # (node-version-file / install-command). [Quelle gate-te diese Steps zusaetzlich auf
+      #  configured == 'true' && doppel-guard.skip != 'true'; der vertragsmaesse Ersatz
+      #  traegt nur die Input-Bedingungen.]
+      - name: Node-Setup (falls konfiguriert)
+        if: inputs.node-version-file != ''
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version-file: ${{ inputs.node-version-file }}
+
+      - name: Projekt-Setup (install-command)
+        if: inputs.install-command != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -c "${{ inputs.install-command }}"
+
+      - name: Spec via Claude
+        id: claude
+        if: steps.setup.outputs.configured == 'true' && steps.doppel-guard.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          ISSUE: ${{ inputs.issue-number }}
+        run: |
+          # Prompt liegt kanonisch in .github/prompts/spec.md (Quelle fuer CI + lokalen /spec-ticket-Command).
+          # Override-Muster: lokale Konsumenten-Datei gewinnt, Fallback zentral (.agent-pipeline).
+          PROMPT=".github/prompts/spec.md"
+          [ -f "$PROMPT" ] || PROMPT=".agent-pipeline/.github/prompts/spec.md"
+          sed -e "s/#ISSUE_NR/${{ inputs.issue-number }}/g" \
+              -e "s/SOFT_DEADLINE/${{ steps.starttime.outputs.soft_deadline_epoch }}/g" \
+              "$PROMPT" > /tmp/claude-prompt.txt
+
+          # Memory-Snippets anhängen (Phase 3: restauriert + schreibt). Snippet-Platzhalter
+          # separat substituieren, da die spec.md-sed oben nur den Prompt-Teil erfasst hat.
+          # Override-Muster: lokale Konsumenten-Datei gewinnt, Fallback zentral (.agent-pipeline).
+          PROMPT=".github/prompts/memory-read.md"
+          [ -f "$PROMPT" ] || PROMPT=".agent-pipeline/.github/prompts/memory-read.md"
+          cat "$PROMPT" >> /tmp/claude-prompt.txt
+          PROMPT=".github/prompts/memory-write.md"
+          [ -f "$PROMPT" ] || PROMPT=".agent-pipeline/.github/prompts/memory-write.md"
+          cat "$PROMPT" >> /tmp/claude-prompt.txt
+          sed -i "s/#ISSUE_NR/${{ inputs.issue-number }}/g" /tmp/claude-prompt.txt
+          sed -i "s/#PHASE/spec/g" /tmp/claude-prompt.txt
+          sed -i "s/#MEMORY_STATUS/${{ steps.setup.outputs.memory-status-text }}/g" /tmp/claude-prompt.txt
+
+          ${{ steps.setup.outputs.invoke-cmd }} "$(cat /tmp/claude-prompt.txt)" \
+            ${{ steps.setup.outputs.invoke-args }} \
+            2>&1 | tee /tmp/claude-output.log
+          test "${PIPESTATUS[0]}" -eq 0 || exit "${PIPESTATUS[0]}"
+
+      - name: Memory-Upload (das Artefakt IST der Speicher der Phasen-Notizen)
+        # Kein Cache-Save mehr — er ist für diese Pipeline platform-seitig unmöglich: GitHubs
+        # Richtlinie vom 2026-06-26 vergibt für Issue-/Label-/PR-Trigger UND die daraus
+        # kaskadierten workflow_run-Läufe nur lese-only Cache-Token. Der frühere Companion
+        # (claude-memory-save.yml) scheiterte deshalb in JEDEM Lauf still mit "cache write
+        # denied: token has no writable scopes" — als ##[warning], also bei grünem Job.
+        # Artefakte unterliegen dieser Restriktion nicht; die Folgephase holt sich das jüngste
+        # nicht-abgelaufene Artefakt dieses Namens (s. setup-claude, Step "Memory-Load").
+        # Name = claude-memory-issue-{N} (steps.setup.outputs.memory-save-key).
+        if: always() && steps.setup.outputs.configured == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.setup.outputs.memory-save-key }}
+          path: ${{ steps.setup.outputs.memory-path }}
+          # 14 Tage: das Artefakt ist jetzt der einzige Speicher, nicht mehr nur ein Transport-
+          # vehikel zum Cache (dort war 1 Tag genug). Muss den ganzen Ticket-Lebenszyklus
+          # überdauern; Phase 7 räumt am Ende ohnehin deterministisch auf. Größe: ~1 KB.
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Label-Post-Assertion (VERDICT parsen, Labels via App-Token force-setzen)
+        if: always() && steps.setup.outputs.configured == 'true' && (steps.claude.outcome == 'success' || steps.claude.outcome == 'failure' || steps.doppel-guard.outputs.skip == 'true')
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          ISSUE: ${{ inputs.issue-number }}
+          GUARD_SKIP: ${{ steps.doppel-guard.outputs.skip }}
+          TEST_PATHS: ${{ inputs.test-paths }}
+        run: |
+          verdict=""
+          if [ -f /tmp/claude-output.log ]; then
+            verdict="$(grep 'VERDICT:' /tmp/claude-output.log | tail -1 | sed -E 's/^.*VERDICT:[[:space:]]*//' | tr -d -c 'A-Za-z0-9-' || true)"
+          fi
+          echo "Claude-Verdict aus Output: '${verdict:-keins}'"
+
+          if [ "${GUARD_SKIP:-false}" = "true" ]; then
+            verdict="ready"
+            echo "::notice::Doppel-Run-Guard: PR existiert bereits – behandele als ready."
+          fi
+
+          # Spec-PR finden: primär closingIssuesReferences, Fallback auf Body-Suche
+          # (PR #585: "Closes NNN" ohne "#" lässt die Referenz sonst leer → Crash).
+          SPEC_PR="$(bash .agent-pipeline/.github/scripts/pr-for-issue.sh --repo "$GITHUB_REPOSITORY" \
+            --issue "$ISSUE" --draft any --out first)"
+          ARTIFACTS_OK="false"
+          if [ -n "$SPEC_PR" ] && [ "$SPEC_PR" != "null" ]; then
+            # Prinzip: Tests nur für Anwendungscode (ADR 0001 + spec.md-NICHT-ANWENDUNGSCODE-Carve-out).
+            # Spec-PR gilt als artefakt-OK, wenn er einen App-Test enthält ODER gar keinen
+            # Anwendungscode berührt (reine Doku/Workflow/Config → keine Test-Pflicht). Ein
+            # Workflow-/Markdown-Test (z. B. .github/workflows/*.test.ts) zählt NICHT als App-Test.
+            # Pfad-Gate dynamisch (Konvertierung): TEST_PATHS (Leerzeichen-getrennte Präfix-Liste,
+            # z. B. "server/src frontend/src frontend/e2e") ersetzt die festverdrahteten Präfixe
+            # der Quelle. LEER = Gate deaktiviert (Konsument ohne Test-Pfad-Gate): dann zählt
+            # jede Test-Datei als App-Test und jeder Datei-Touch als Anwendungscode. Bewusst
+            # startswith/endswith statt test()-Regex: das gh---jq-Quoting verschluckt Backslash-
+            # Punkte — die endswith-Alternative der Quelle bleibt.
+            if [ -n "$TEST_PATHS" ]; then
+              PATHS_JSON="$(printf '%s' "$TEST_PATHS" | tr ' ' '\n' | sed -e 's:/$::' -e '/^$/d' | jq -R . | jq -s .)"
+              # any($paths[]; . as $p | ...): das as-Binding ist Pflicht — ein Pipe
+              # "$f | startswith(. + ...)" wuerde "." auf $f (Datei) rebinden statt auf den
+              # Praefix und immer false liefern.
+              APP_TEST_JQ='[.files[].path as $f | select((any($paths[]; . as $p | $f | startswith($p + "/"))) and ($f | (endswith(".test.ts") or endswith(".test.tsx") or endswith(".spec.ts") or endswith(".spec.tsx"))))] | any'
+              TOUCHES_APP_JQ='[.files[].path as $f | select(any($paths[]; . as $p | $f | startswith($p + "/")))] | any'
+              PATHS_ARGS=(--argjson paths "$PATHS_JSON")
+            else
+              APP_TEST_JQ='[.files[].path | select(endswith(".test.ts") or endswith(".test.tsx") or endswith(".spec.ts") or endswith(".spec.tsx"))] | any'
+              TOUCHES_APP_JQ='[.files[].path] | any'
+              PATHS_ARGS=()
+            fi
+            HAS_APP_TEST="$(gh pr view "$SPEC_PR" --repo "$GITHUB_REPOSITORY" --json files \
+              "${PATHS_ARGS[@]}" --jq "$APP_TEST_JQ" 2>/dev/null || echo "false")"
+            TOUCHES_APP="$(gh pr view "$SPEC_PR" --repo "$GITHUB_REPOSITORY" --json files \
+              "${PATHS_ARGS[@]}" --jq "$TOUCHES_APP_JQ" 2>/dev/null || echo "false")"
+            echo "::notice::Spec-PR #$SPEC_PR: HAS_APP_TEST=$HAS_APP_TEST TOUCHES_APP=$TOUCHES_APP"
+            if [ "$HAS_APP_TEST" = "true" ] || [ "$TOUCHES_APP" != "true" ]; then
+              ARTIFACTS_OK="true"
+              [ "$TOUCHES_APP" != "true" ] && echo "::notice::Spec-PR #$SPEC_PR: kein Anwendungscode berührt — Test-Pflicht entfällt (nur App-Code wird getestet)"
+            fi
+          fi
+
+          if [ "$verdict" = "ready" ]; then
+            if [ "$ARTIFACTS_OK" != "true" ]; then
+              echo "::error title=❌ Spec fehlt::VERDICT ready, aber kein Spec-PR mit Tests."
+              exit 1
+            fi
+            final="ready"
+          elif [ "$verdict" = "spec-ready" ]; then
+            if [ "$ARTIFACTS_OK" = "true" ]; then
+              final="ready"
+            else
+              final="spec-ready"
+            fi
+          else
+            if [ "$ARTIFACTS_OK" = "true" ]; then
+              final="ready"
+            else
+              echo "::error title=❌ Spec fehlgeschlagen::Kein VERDICT und keine Artefakte."
+              exit 1
+            fi
+          fi
+
+          gh label create "ai:ready" --repo "$GITHUB_REPOSITORY" --color 0E8A16 2>/dev/null || true
+          gh label create "ai:spec-ready" --repo "$GITHUB_REPOSITORY" --color FBCA04 2>/dev/null || true
+
+          gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --remove-label "ai:spec-ready" 2>/dev/null || true
+          gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --remove-label "ai:ready" 2>/dev/null || true
+
+          if [ "$final" = "ready" ]; then
+            gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --add-label "ai:ready"
+            # ux:ready bleibt kleben — Umsetzung verlangt es als Pre-Check.
+            echo "::notice::Label gesetzt: ai:ready (verifiziert: Spec-PR + rote Tests)"
+          else
+            # Partial-Retry: ux:ready remove+re-add retriggert die Spec;
+            # UX bleibt No-op (ux:ready beim Precheck-Zeitpunkt wieder da).
+            # Reihenfolge: ai:spec-ready zuerst, ux:ready zuletzt.
+            gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --remove-label "ux:ready" 2>/dev/null || true
+            gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --add-label "ai:spec-ready"
+            gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --add-label "ux:ready"
+            echo "::notice::Label gesetzt: ai:spec-ready + ux:ready (Partial)"
+          fi
+
+      - name: Ergebnis zusammenfassen
+        if: always() && steps.setup.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          ISSUE: ${{ inputs.issue-number }}
+          OUTCOME: ${{ steps.claude.outcome }}
+          SKIP_DOPPEL: ${{ steps.doppel-guard.outputs.skip }}
+        run: |
+          labels="$(gh issue view "$ISSUE" --repo "$GITHUB_REPOSITORY" --json labels --jq '[.labels[].name] | join(", ")' 2>/dev/null || true)"
+          # Eigener Arm fuer den Doppel-Run-Guard: ohne ihn faellt der gewollte Skip auf den
+          # Fehler-Arm (OUTCOME ist leer, weil der claude-Step nie lief) und meldet ❌.
+          if [ "${SKIP_DOPPEL:-false}" = "true" ]; then
+            echo "::notice title=⏭️ Spec übersprungen::Issue #${ISSUE} — PR existiert bereits"
+          elif [ "$OUTCOME" = "success" ]; then
+            echo "::notice title=✅ Spec erfolgreich::Issue #${ISSUE} — Rote Tests geschrieben"
+          elif [ "$OUTCOME" = "cancelled" ]; then
+            echo "::warning title=⏸️ Spec abgebrochen"
+          else
+            echo "::error title=❌ Spec fehlgeschlagen"
+          fi
+          {
+            echo "### Spec #${ISSUE} – fertig"
+            echo "- Claude-Schritt: \`${OUTCOME:-unbekannt}\`"
+            echo "- Labels: ${labels:-keine}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 🩺 Z.AI Fair-Usage-Check (1313)
+        # Rohausgabe des Claude-Laufs auf z.ai-Fehler 1313 (Fair Usage) durchsuchen
+        # und Ergebnis als Annotation + Job-Summary sichtbar machen.
+        if: always()
+        uses: deleonio/agent-pipeline/.github/actions/llm-fair-usage-check@v1.0

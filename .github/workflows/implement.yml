@@ -1,0 +1,413 @@
+# Callee: Phase 4 (Umsetzung) als wiederverwendbarer workflow_call-Workflow — mechanisch
+# konvertiert aus priority-pilot/.github/workflows/04-claude-implement.yml (7-Phasen-Stand).
+# Consumer-Stub: stubs/04-claude-implement.yml ("4/7 Umsetzung") — Trigger (issues labeled),
+# Label-Filter ai:ready und Concurrency (claude-implement) leben IM STUB; der Callee trägt
+# bewusst KEIN workflow-concurrency. Vertrag: Event-Payload nur via inputs, secrets/vars
+# unverändert caller-seitig, Laufzeit-Logik (precheck/Labels/Soft-Abort) unverändert.
+
+on:
+  workflow_call:
+    inputs:
+      issue-number:
+        description: 'Issue-Nummer (Stub reicht github.event.issue.number durch)'
+        required: true
+        type: string
+      node-version-file:
+        description: 'Node-Version-Datei für setup-node (leer = kein Node-Setup im Callee)'
+        required: false
+        type: string
+        default: ''
+      install-command:
+        description: 'Projekt-Setup-Kommando (leer = kein Setup); Stub-Default: corepack/pnpm/lefthook'
+        required: false
+        type: string
+        default: ''
+      verify-command:
+        description: 'QS-Kommando (VERIFY_CMD) für den Prompt; leer = heutiger Festtext test/format/lint/knip'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      APP_ID:
+        required: false
+      APP_PRIVATE_KEY:
+        required: false
+      ZAI_API_KEY:
+        required: false
+      CLAUDE_API_KEY:
+        required: false
+      OPENROUTER_API_KEY:
+        required: false
+      TAILSCALE_AUTH_KEY:
+        required: false
+
+jobs:
+  precheck:
+    # Unveränderliches Event-Faktum (Label-Filter ai:ready) filtert jetzt der STUB im job-if
+    # (spart den Runner für No-op-Trigger — die Vorläufer-Phase feuert auf JEDES `labeled` im
+    # Repo). Wird der Stub-if falsch, läuft der Called-Workflow gar nicht erst. Hier im Callee
+    # bleibt nur die Laufzeitprüfung:
+    # Label-IST-Zustand zur Laufzeit: ai:ready + ai:analyzed müssen JETZT (nach dem Warten in
+    # der globalen Phasen-Queue) noch am Issue kleben. Soll-Werte stehen zentral in
+    # .github/scripts/check-phase-label.sh; hier wird nur der Phasen-Name übergeben.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read # lokale Action + Skript auschecken
+      issues: read
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Label-Pre-Check (IST-Zustand zur Laufzeit)
+        id: check
+        uses: deleonio/agent-pipeline/.github/actions/check-phase-label@v1.0
+        with:
+          phase: implement
+          ticket: ${{ inputs.issue-number }}
+
+  implement:
+    needs: precheck
+    # `result == 'failure'` ist FAIL-OPEN und beabsichtigt: das Skript fällt bei API-Fehlern
+    # bewusst auf "laufen lassen" zurück, aber ein Fehler AUSSERHALB (Checkout, Timeout,
+    # Runner-Ausfall) würde den Hauptjob sonst stumm überspringen — Trigger konsumiert, niemand
+    # arbeitet, nichts re-armt. Ein übersprungener precheck (result == 'skipped', No-op-Trigger)
+    # erfüllt keine der beiden Klauseln und lässt den Hauptjob korrekt entfallen.
+    if: >-
+      ${{ always()
+          && (needs.precheck.outputs.proceed == 'true' || needs.precheck.result == 'failure') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    permissions:
+      contents: read
+      id-token: write
+      actions: write
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Startzeit merken (für weiches Zeitlimit)
+        id: starttime
+        run: |
+          now=$(date +%s)
+          echo "epoch=$now" >> "$GITHUB_OUTPUT"
+          echo "soft_deadline_epoch=$((now + 840))" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Claude Code (mit Memory-Load)
+        id: setup
+        uses: deleonio/agent-pipeline/.github/actions/setup-claude@v1.0
+        with:
+          needs-mcp: true
+          tools-tier: full
+          event-type: ${{ github.event_name }}
+          ticket-ref: ${{ inputs.issue-number }}
+          app-id: ${{ secrets.APP_ID }}
+          app-private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          llm-provider: ${{ vars.LLM_PROVIDER }}
+          model: ${{ vars.CLAUDE_MODEL_IMPLEMENT || 'opus' }}
+          zai-api-key: ${{ secrets.ZAI_API_KEY }}
+          claude-api-key: ${{ secrets.CLAUDE_API_KEY }}
+          openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
+          zai-settings-json: ${{ vars.CLAUDE_CODE_SETTINGS_LOCAL_ZAI }}
+          openrouter-settings-json: ${{ vars.CLAUDE_CODE_SETTINGS_LOCAL_OPENROUTER }}
+          tailscale-authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          tailscale-exit-node: ${{ vars.TAILSCALE_EXIT_NODE }}
+          memory-load: 'true'
+          expect-memory: 'true'
+
+      - name: agent-pipeline Version
+        if: steps.setup.outputs.configured == 'true'
+        env:
+          PIPELINE_SHA: ${{ steps.setup.outputs.pipeline-sha }}
+        run: |
+          echo "::notice title=agent-pipeline::Ref v1.0${PIPELINE_SHA:+ @ ${PIPELINE_SHA:0:12}}"
+          echo "- agent-pipeline: v1.0${PIPELINE_SHA:+ @ ${PIPELINE_SHA:0:12}}" >> "$GITHUB_STEP_SUMMARY"
+
+      # Kein Skip-Guard ("läuft bereits") mehr: Die globale Phasen-Serialisierung (statische
+      # concurrency-Gruppe) lässt Läufe desselben Issues nie parallel laufen, und der precheck
+      # dedupliziert über den Label-IST-Zustand. Ein Lauf-Listen-Guard würde hier nur noch
+      # queued Nachfolger finden und das FALSCHE Skip auslösen.
+
+      - name: Issue einem Menschen zuweisen (Best-Effort)
+        if: steps.setup.outputs.configured == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          ISSUE: ${{ inputs.issue-number }}
+          ASSIGNEE: ${{ github.event.sender.type == 'User' && github.event.sender.login || (github.event.issue.user.type == 'User' && github.event.issue.user.login || '') }}
+        run: |
+          if [ -z "$ASSIGNEE" ]; then
+            echo "::notice::Kein menschlicher Assignee ermittelbar."
+            exit 0
+          fi
+          gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --add-assignee "$ASSIGNEE"
+
+      - name: Doppel-Run-Guard (ready-PR existiert bereits)
+        id: doppel-guard
+        if: steps.setup.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          ISSUE: ${{ inputs.issue-number }}
+        run: |
+          # Ready-PR = nicht-draft PR zu diesem Issue. Helper mit closingRef- +
+          # Body-Fallback (PR #585: "Closes NNN" ohne "#" sonst nicht gefunden).
+          existing="$(bash .agent-pipeline/.github/scripts/pr-for-issue.sh --repo "$GITHUB_REPOSITORY" \
+            --issue "$ISSUE" --draft no --out count)"
+          if [ "${existing:-0}" -gt 0 ]; then
+            echo "::notice::Umsetzung übersprungen – ready-PR existiert bereits für Issue #$ISSUE."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Node-Setup (falls konfiguriert)
+        # Ersetzt pnpm/action-setup + setup-node (.nvmrc, cache: pnpm) der Quelle: der Consumer
+        # steuert via inputs (Stub-Default .nvmrc + corepack/pnpm im install-command). Die
+        # Quell-Guards (configured + kein Doppel-Run-Guard-Skip) bleiben verUNDet — Setup
+        # entfällt in Skip-Läufen wie bisher.
+        if: steps.setup.outputs.configured == 'true' && steps.doppel-guard.outputs.skip != 'true' && inputs.node-version-file != ''
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version-file: ${{ inputs.node-version-file }}
+
+      - name: Projekt-Setup (install-command)
+        # Ersetzt "pnpm install --frozen-lockfile" + "pnpm exec lefthook install" der Quelle
+        # (plus corepack enable aus dem früheren pnpm/action-setup) — als ein Consumer-Kommando.
+        if: steps.setup.outputs.configured == 'true' && steps.doppel-guard.outputs.skip != 'true' && inputs.install-command != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -c "${{ inputs.install-command }}"
+
+      - name: Fortsetzungs-Stand prüfen (ai:continued)
+        id: continued-before
+        if: steps.setup.outputs.configured == 'true' && steps.doppel-guard.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          ISSUE: ${{ inputs.issue-number }}
+        run: |
+          already="$(gh issue view "$ISSUE" --repo "$GITHUB_REPOSITORY" --json labels --jq 'any(.labels[]; .name == "ai:continued")' 2>/dev/null || echo false)"
+          echo "already=${already:-false}" >> "$GITHUB_OUTPUT"
+
+      - name: Umsetzung via Claude
+        id: claude
+        if: steps.setup.outputs.configured == 'true' && steps.doppel-guard.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          ISSUE: ${{ inputs.issue-number }}
+          VERIFY_CMD: ${{ inputs.verify-command }}
+        run: |
+          cat > /tmp/claude-prompt.txt << 'CLAUDE_EOF'
+          #RESUME_HINT
+          FOKUS: NUR Issue #ISSUE_NR. Nur die für die Akzeptanzkriterien notwendigen Dateien/Zeilen ändern, kein Refactoring am Rande. KEINE Abstecher. Token sparen: kurz, präzise, direkt.
+
+          ⚠️ KI-UX-Block: Falls das Issue UX-Aspekte hat (KI-UX:END-Block im Issue-Body vorhanden), UX-Anforderungen aus diesem Block beachten.
+
+          ABLAUF (STRIKT):
+            1. SOFORT starten.
+            2. Analyse lesen & schnell verifizieren (KEINE vollständige Re-Triage!):
+               Akzeptanzkriterien aus BODY-BLOCK übernehmen (gh issue view #ISSUE_NR --json body -q .body).
+               Prüfe NUR, ob die genannten Dateien noch existieren. Ampel 🔴 → NICHT umsetzen, ai:ready entfernen, begründet kommentieren und stoppen.
+            3. Spec-Modus (Regelfall): vorhandenen DRAFT-PR auschecken
+               (gh pr list --state open --draft --json number,headRefName,closingIssuesReferences,
+               den mit Issue #ISSUE_NR; FALLS leer weil Spec "Closes NNN" ohne "#" schrieb:
+               Fallback gh pr list --state open --draft --search "ISSUE_NR in:body" --json number,headRefName;
+               dann git fetch origin && git switch <headRefName>).
+               Dessen ROTE Tests GRÜN machen – Tests NICHT ändern (Gewaltenteilung).
+               **Hinweis:** Obsolete Tests wurden bereits in der Spec-Stufe entfernt. Falls trotzdem Widerspruch auffällt → NICHT still ändern/löschen, sondern im PR-Body Abschnitt "Test-Pflege-Bedarf" mit Datei:Zeile + Begründung anlegen.
+               Fallback (kein Draft-PR): eigenen Branch + Tests selbst schreiben.
+            4. #VERIFY_LINE
+               Bei Confirm-/Lösch-/Zerstör-Dialogen: docs/ux-pattern-sequential-confirmation.md anwenden – sequenzielle Ja/Nein-Schritte, striktes Fokus-Management beim Übergang (verbindliche A11y-Vorgabe).
+            5. Committen, Branch pushen. Im Spec-Modus Draft-PR review-bereit machen (gh pr ready <nr>), Beschreibung ergänzen.
+
+          ⚠️ LABELS: KEINE Labels setzen! Workflow übernimmt das automatisch.
+
+          VERDICT: GANZ AM ENDE GENAU EINE Zeile:
+            - VERDICT: needs-review (Implementierung fertig + PR review-bereit)
+            - VERDICT: not-ready (Partial – PR als Draft belassen, Folgelauf nötig)
+
+          ZEITLIMIT: Soft-Deadline = SOFT_DEADLINE. Vor jedem Schritt: [ $(date +%s) -ge SOFT_DEADLINE ]. Bei OVER: aktuellen Stand committen+pushen, Turn beenden.
+
+          Idempotenz: Draft-PR mit Closes #ISSUE_NR ist normaler Spec-Eingang – aufgreifen. Nicht-Draft-PR = Umsetzung schon gelaufen → Lauf beenden.
+          CLAUDE_EOF
+
+          # Memory-Snippets anhängen (Phase 4: restauriert + schreibt). Vor den seds, damit
+          # deren Platzhalter (#ISSUE_NR/#PHASE/#MEMORY_STATUS) mit substituiert werden.
+          # Override-Muster: lokale Konsumenten-Datei gewinnt, sonst der Pipeline-Default aus
+          # dem .agent-pipeline-Checkout (stellt setup-claude bereit).
+          MEMORY_READ=".github/prompts/memory-read.md"
+          [ -f "$MEMORY_READ" ] || MEMORY_READ=".agent-pipeline/.github/prompts/memory-read.md"
+          cat "$MEMORY_READ" >> /tmp/claude-prompt.txt
+          MEMORY_WRITE=".github/prompts/memory-write.md"
+          [ -f "$MEMORY_WRITE" ] || MEMORY_WRITE=".agent-pipeline/.github/prompts/memory-write.md"
+          cat "$MEMORY_WRITE" >> /tmp/claude-prompt.txt
+
+          # QS-Zeile (Input verify-command): gesetzt → VERIFY_CMD als verbindliche QS-Vorgabe
+          # (Stub-Default spiegelt die heutigen Prompt-Anforderungen: pnpm format && pnpm lint
+          # && pnpm test); leer → der heutige Festtext der Quelle. Bash-Expansion statt sed:
+          # VERIFY_CMD enthält i. d. R. '&&' — in einer sed-REPLACEMENT stünde jedes '&' für
+          # das gesamte Match (Kommando-Korruption).
+          if [ -n "${VERIFY_CMD:-}" ]; then
+            verify_line="Code bis die Qualitätssicherung grün ist — Qualitätssicherung (VERIFY_CMD): ${VERIFY_CMD}."
+          else
+            verify_line="Code bis pnpm test grün, dann pnpm format + pnpm lint + pnpm knip."
+          fi
+          prompt="$(cat /tmp/claude-prompt.txt)"
+          printf '%s\n' "${prompt//#VERIFY_LINE/$verify_line}" > /tmp/claude-prompt.txt
+
+          sed -i "s/#ISSUE_NR/${{ inputs.issue-number }}/g" /tmp/claude-prompt.txt
+          sed -i "s/#PHASE/implement/g" /tmp/claude-prompt.txt
+          sed -i "s/#MEMORY_STATUS/${{ steps.setup.outputs.memory-status-text }}/g" /tmp/claude-prompt.txt
+          # Resume-Hinweis: bei ai:continued (Folgelauaf nach Soft-Abort) Memory-Pflicht betonen.
+          if [ "${{ steps.continued-before.outputs.already }}" = "true" ]; then
+            sed -i "s|#RESUME_HINT|⚠️ FORTSETZUNGS-Lauf (ai:continued) — lies ZUERST .claude/memory/ und SETZE FORT, starte NICHT neu, wiederhole nichts aus 'Erledigt'!|g" /tmp/claude-prompt.txt
+          else
+            sed -i "s/#RESUME_HINT//g" /tmp/claude-prompt.txt
+          fi
+          sed -i "s/SOFT_DEADLINE/${{ steps.starttime.outputs.soft_deadline_epoch }}/g" /tmp/claude-prompt.txt
+
+          ${{ steps.setup.outputs.invoke-cmd }} "$(cat /tmp/claude-prompt.txt)" \
+            ${{ steps.setup.outputs.invoke-args }} \
+            2>&1 | tee /tmp/claude-output.log
+          test "${PIPESTATUS[0]}" -eq 0 || exit "${PIPESTATUS[0]}"
+
+      - name: Memory-Upload (das Artefakt IST der Speicher der Phasen-Notizen)
+        # Kein Cache-Save mehr — er ist für diese Pipeline platform-seitig unmöglich: GitHubs
+        # Richtlinie vom 2026-06-26 vergibt für Issue-/Label-/PR-Trigger UND die daraus
+        # kaskadierten workflow_run-Läufe nur lese-only Cache-Token. Der frühere Companion
+        # (claude-memory-save.yml) scheiterte deshalb in JEDEM Lauf still mit "cache write
+        # denied: token has no writable scopes" — als ##[warning], also bei grünem Job.
+        # Artefakte unterliegen dieser Restriktion nicht; die Folgephase holt sich das jüngste
+        # nicht-abgelaufene Artefakt dieses Namens (s. setup-claude, Step "Memory-Load").
+        # Name = claude-memory-issue-{N} (steps.setup.outputs.memory-save-key).
+        if: always() && steps.setup.outputs.configured == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.setup.outputs.memory-save-key }}
+          path: ${{ steps.setup.outputs.memory-path }}
+          # 14 Tage: das Artefakt ist jetzt der einzige Speicher, nicht mehr nur ein Transport-
+          # vehikel zum Cache (dort war 1 Tag genug). Muss den ganzen Ticket-Lebenszyklus
+          # überdauern; Phase 7 räumt am Ende ohnehin deterministisch auf. Größe: ~1 KB.
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Label-Post-Assertion (VERDICT parsen, Labels via App-Token force-setzen)
+        if: always() && steps.setup.outputs.configured == 'true' && (steps.claude.outcome == 'success' || steps.claude.outcome == 'failure' || steps.claude.outcome == 'cancelled' || steps.doppel-guard.outputs.skip == 'true')
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          ISSUE: ${{ inputs.issue-number }}
+          ALREADY_CONTINUED: ${{ steps.continued-before.outputs.already }}
+          GUARD_SKIP: ${{ steps.doppel-guard.outputs.skip }}
+        run: |
+          verdict=""
+          if [ -f /tmp/claude-output.log ]; then
+            verdict="$(grep 'VERDICT:' /tmp/claude-output.log | tail -1 | sed -E 's/^.*VERDICT:[[:space:]]*//' | tr -d -c 'A-Za-z0-9-' || true)"
+          fi
+          echo "Claude-Verdict aus Output: '${verdict:-keins}'"
+
+          # Dieser Step laeuft im Doppel-Run-Guard-Skip bewusst mit (siehe if oben): er soll das
+          # Label fuer den BESTEHENDEN PR setzen. Ohne diesen Arm haengt das Ergebnis daran, dass
+          # die ARTIFACTS_OK-Pruefung den fremden PR zufaellig als fertig erkennt — richtig, aber
+          # unbelegt. Explizit machen, symmetrisch zu 03-claude-spec.yml.
+          if [ "${GUARD_SKIP:-false}" = "true" ]; then
+            verdict="needs-review"
+            echo "::notice::Doppel-Run-Guard: PR existiert bereits — behandele als needs-review."
+          fi
+
+          # PR finden: primär closingIssuesReferences, Fallback auf Body-Suche
+          # (PR #585: "Closes NNN" ohne "#" lässt die Referenz sonst leer → Crash).
+          PR_NR="$(bash .agent-pipeline/.github/scripts/pr-for-issue.sh --repo "$GITHUB_REPOSITORY" \
+            --issue "$ISSUE" --draft no --out first)"
+          ARTIFACTS_OK="false"
+          if [ -n "$PR_NR" ] && [ "$PR_NR" != "null" ]; then
+            PR_DRAFT="$(gh pr view "$PR_NR" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null || echo "true")"
+            PR_COMMITS="$(gh pr view "$PR_NR" --repo "$GITHUB_REPOSITORY" --json commits --jq '.commits | length' 2>/dev/null || echo "0")"
+            if [ "$PR_DRAFT" != "true" ] && [ "${PR_COMMITS:-0}" -gt 0 ]; then
+              ARTIFACTS_OK="true"
+            fi
+          fi
+
+          if [ "$verdict" = "needs-review" ]; then
+            if [ "$ARTIFACTS_OK" != "true" ]; then
+              echo "::error title=❌ PR fehlt::VERDICT needs-review, aber kein fertiger PR gefunden."
+              exit 1
+            fi
+            final="needs-review"
+          elif [ "$verdict" = "not-ready" ]; then
+            if [ "$ARTIFACTS_OK" = "true" ]; then
+              final="needs-review"
+            else
+              final="not-ready"
+            fi
+          else
+            if [ "$ARTIFACTS_OK" = "true" ]; then
+              final="needs-review"
+            else
+              final="not-ready"
+            fi
+          fi
+
+          gh label create "ai:needs-review" --repo "$GITHUB_REPOSITORY" --color FBCA04 2>/dev/null || true
+
+          if [ "$final" = "needs-review" ]; then
+            gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --remove-label "ai:ready" 2>/dev/null || true
+            gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --remove-label "ai:continued" 2>/dev/null || true
+            gh pr edit "$PR_NR" --repo "$GITHUB_REPOSITORY" --remove-label "ai:needs-review" 2>/dev/null || true
+            gh pr edit "$PR_NR" --repo "$GITHUB_REPOSITORY" --add-label "ai:needs-review"
+            echo "::notice::Labels gesetzt: ai:needs-review an PR #${PR_NR}"
+
+          else
+            if [ "${ALREADY_CONTINUED:-false}" = "true" ]; then
+              gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --remove-label "ai:ready" 2>/dev/null || true
+              gh label create "ai:to-big-issue" --repo "$GITHUB_REPOSITORY" --color B60205 2>/dev/null || true
+              gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --add-label "ai:to-big-issue" 2>/dev/null || true
+              echo "::warning::Obergrenze erreicht (2. Soft-Abort) – ai:to-big-issue gesetzt"
+            else
+              gh label create "ai:continued" --repo "$GITHUB_REPOSITORY" --color FBCA04 2>/dev/null || true
+              gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --add-label "ai:continued"
+              gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --remove-label "ai:ready" 2>/dev/null || true
+              gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --add-label "ai:ready"
+              echo "::notice::Soft-Abort – ai:continued gesetzt, ai:ready retriggert"
+            fi
+          fi
+
+      - name: Ergebnis zusammenfassen
+        if: always() && steps.setup.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          ISSUE: ${{ inputs.issue-number }}
+          OUTCOME: ${{ steps.claude.outcome }}
+          SKIP_DOPPEL: ${{ steps.doppel-guard.outputs.skip }}
+        run: |
+          labels="$(gh issue view "$ISSUE" --repo "$GITHUB_REPOSITORY" --json labels --jq '[.labels[].name] | join(", ")' 2>/dev/null || true)"
+          # Eigener Arm fuer den Doppel-Run-Guard: ohne ihn faellt der gewollte Skip auf den
+          # Fehler-Arm (OUTCOME ist leer, weil der claude-Step nie lief) und meldet ❌.
+          if [ "${SKIP_DOPPEL:-false}" = "true" ]; then
+            echo "::notice title=⏭️ Umsetzung übersprungen::Issue #${ISSUE} — PR existiert bereits"
+          elif [ "$OUTCOME" = "success" ]; then
+            echo "::notice title=✅ Umsetzung erfolgreich::Issue #${ISSUE}"
+          elif [ "$OUTCOME" = "cancelled" ]; then
+            echo "::warning title=⏸️ Umsetzung abgebrochen"
+          else
+            echo "::error title=❌ Umsetzung fehlgeschlagen"
+          fi
+          {
+            echo "### Umsetzung #${ISSUE} – fertig"
+            echo "- Claude-Schritt: \`${OUTCOME:-unbekannt}\`"
+            echo "- Labels: ${labels:-keine}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 🩺 Z.AI Fair-Usage-Check (1313)
+        # Rohausgabe des Claude-Laufs auf z.ai-Fehler 1313 (Fair Usage) durchsuchen
+        # und Ergebnis als Annotation + Job-Summary sichtbar machen.
+        if: always()
+        uses: deleonio/agent-pipeline/.github/actions/llm-fair-usage-check@v1.0

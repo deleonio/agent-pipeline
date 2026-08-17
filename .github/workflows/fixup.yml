@@ -1,0 +1,443 @@
+# Callee: Phase 6 (Fixup) als wiederverwendbarer workflow_call-Workflow — mechanisch
+# konvertiert aus priority-pilot/.github/workflows/06-claude-pr-fixup.yml (7-Phasen-Stand).
+# Consumer-Stub: stubs/06-claude-pr-fixup.yml ("6/7 Fixup") — Trigger (pull_request labeled),
+# Label-Filter ai:needs-changes, FORK-GUARD und Concurrency (claude-pr-fixup) leben IM STUB;
+# der Callee trägt bewusst KEIN workflow-concurrency. Vertrag: Event-Payload nur via inputs
+# (PR-Head-Ref als explizites Input head-ref — der Callee-Checkout braucht ihn als ref).
+
+on:
+  workflow_call:
+    inputs:
+      pr-number:
+        description: 'PR-Nummer (Stub reicht github.event.pull_request.number durch)'
+        required: true
+        type: string
+      head-ref:
+        description: 'PR-Head-Branch (Stub reicht github.event.pull_request.head.ref durch; Callee checkt ihn aus)'
+        required: true
+        type: string
+      node-version-file:
+        description: 'Node-Version-Datei für setup-node (leer = kein Node-Setup im Callee)'
+        required: false
+        type: string
+        default: ''
+      install-command:
+        description: 'Projekt-Setup-Kommando (leer = kein Setup); Stub-Default: corepack/pnpm/lefthook'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      APP_ID:
+        required: false
+      APP_PRIVATE_KEY:
+        required: false
+      ZAI_API_KEY:
+        required: false
+      CLAUDE_API_KEY:
+        required: false
+      OPENROUTER_API_KEY:
+        required: false
+      TAILSCALE_AUTH_KEY:
+        required: false
+
+jobs:
+  precheck:
+    # Unveränderliche Event-Fakten (Label-Filter ai:needs-changes + FORK-GUARD) filtert jetzt
+    # der STUB im job-if — weiterhin VOR jedem Callee-Step, denn der Fork-Guard ist an dieser
+    # Stelle sicherheitsrelevant: `actions/checkout` holt den PR-Code, und die Action samt
+    # Skript würde daraus ausgeführt. Stünde der Guard erst am Hauptjob, führte ein Fork-PR mit
+    # manipuliertem check-phase-label.sh eigenen Bash aus, sobald irgendjemand ein Label setzt.
+    # Vor dieser Umstellung gab es für Fork-PRs gar keinen Checkout in 05.
+    # Label-IST-Zustand zur Laufzeit: ai:needs-changes muss JETZT (nach dem Warten in der
+    # globalen Phasen-Queue) noch am PR kleben und der PR offen + nicht-draft sein.
+    # Soll-Werte stehen zentral in .github/scripts/check-phase-label.sh; hier wird nur der
+    # Phasen-Name übergeben.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read # lokale Action + Skript auschecken
+      pull-requests: read
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Label-Pre-Check (IST-Zustand zur Laufzeit)
+        id: check
+        uses: deleonio/agent-pipeline/.github/actions/check-phase-label@v1.0
+        with:
+          phase: fixup
+          ticket: ${{ inputs.pr-number }}
+
+  fixup:
+    needs: precheck
+    # `result == 'failure'` ist FAIL-OPEN und beabsichtigt: das Skript fällt bei API-Fehlern
+    # bewusst auf "laufen lassen" zurück, aber ein Fehler AUSSERHALB (Checkout, Timeout,
+    # Runner-Ausfall) würde den Hauptjob sonst stumm überspringen — Trigger konsumiert, niemand
+    # arbeitet, nichts re-armt. Ein übersprungener precheck (result == 'skipped', No-op-Trigger
+    # ODER Fork-PR) erfüllt keine der beiden Klauseln und lässt den Hauptjob korrekt entfallen —
+    # der Fork-Guard aus dem Stub-job-if wirkt dadurch weiterhin auch für den Hauptjob.
+    if: >-
+      ${{ always()
+          && (needs.precheck.outputs.proceed == 'true' || needs.precheck.result == 'failure') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    permissions:
+      contents: read
+      id-token: write
+      actions: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ inputs.head-ref }}
+
+      - name: Startzeit merken (für weiches Zeitlimit)
+        id: starttime
+        run: |
+          now=$(date +%s)
+          echo "epoch=$now" >> "$GITHUB_OUTPUT"
+          echo "soft_deadline_epoch=$((now + 600))" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Claude Code (mit Memory-Load)
+        id: setup
+        uses: deleonio/agent-pipeline/.github/actions/setup-claude@v1.0
+        with:
+          needs-mcp: false
+          tools-tier: full
+          event-type: ${{ github.event_name }}
+          ticket-ref: ${{ inputs.pr-number }}
+          app-id: ${{ secrets.APP_ID }}
+          app-private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          llm-provider: ${{ vars.LLM_PROVIDER }}
+          model: ${{ vars.CLAUDE_MODEL_FIXUP || 'sonnet' }}
+          zai-api-key: ${{ secrets.ZAI_API_KEY }}
+          claude-api-key: ${{ secrets.CLAUDE_API_KEY }}
+          openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
+          zai-settings-json: ${{ vars.CLAUDE_CODE_SETTINGS_LOCAL_ZAI }}
+          openrouter-settings-json: ${{ vars.CLAUDE_CODE_SETTINGS_LOCAL_OPENROUTER }}
+          tailscale-authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          tailscale-exit-node: ${{ vars.TAILSCALE_EXIT_NODE }}
+          memory-load: 'true'
+          expect-memory: 'true'
+
+      - name: agent-pipeline Version
+        if: steps.setup.outputs.configured == 'true'
+        env:
+          PIPELINE_SHA: ${{ steps.setup.outputs.pipeline-sha }}
+        run: |
+          echo "::notice title=agent-pipeline::Ref v1.0${PIPELINE_SHA:+ @ ${PIPELINE_SHA:0:12}}"
+          echo "- agent-pipeline: v1.0${PIPELINE_SHA:+ @ ${PIPELINE_SHA:0:12}}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Node-Setup (falls konfiguriert)
+        # Ersetzt pnpm/action-setup + setup-node (.nvmrc, cache: pnpm) der Quelle: der Consumer
+        # steuert via inputs (Stub-Default .nvmrc + corepack/pnpm im install-command). Der
+        # Quell-Guard (configured) bleibt verUNDet — Setup entfällt in unkonfigurierten Läufen.
+        if: steps.setup.outputs.configured == 'true' && inputs.node-version-file != ''
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version-file: ${{ inputs.node-version-file }}
+
+      - name: Projekt-Setup (install-command)
+        # Ersetzt "pnpm install --frozen-lockfile" + "pnpm exec lefthook install" der Quelle
+        # (plus corepack enable aus dem früheren pnpm/action-setup) — als ein Consumer-Kommando.
+        if: steps.setup.outputs.configured == 'true' && inputs.install-command != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -c "${{ inputs.install-command }}"
+
+      - name: Merge-Konflikte prüfen und auflösen
+        id: resolve-conflicts
+        if: steps.setup.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          PR: ${{ inputs.pr-number }}
+          REPO: ${{ github.repository }}
+          TARGET_BRANCH: ${{ github.event.pull_request.base.ref }}
+          HEAD_BRANCH: ${{ inputs.head-ref }}
+        run: |
+          set -euo pipefail
+          if ! state_json="$(gh pr view "$PR" --repo "$REPO" --json mergeable,mergeStateStatus 2>/dev/null)"; then
+            echo "conflict=unknown" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          mergeable="$(echo "$state_json" | jq -r '.mergeable')"
+          merge_state="$(echo "$state_json" | jq -r '.mergeStateStatus')"
+          if [ "$mergeable" = "MERGEABLE" ]; then echo "conflict=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if [ "$mergeable" = "UNKNOWN" ] || [ "$mergeable" = "null" ]; then
+            sleep 5
+            state_json="$(gh pr view "$PR" --repo "$REPO" --json mergeable,mergeStateStatus 2>/dev/null || true)"
+            mergeable="$(echo "$state_json" | jq -r '.mergeable' 2>/dev/null || echo 'UNKNOWN')"
+          fi
+          if [ "$mergeable" = "UNKNOWN" ]; then echo "conflict=unknown" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if [ "$merge_state" = "DIRTY" ] || [ "$mergeable" = "CONFLICTING" ]; then
+            git fetch origin "$TARGET_BRANCH" --depth=1 --no-tags
+            if git merge origin/"$TARGET_BRANCH" --no-ff --no-edit -m "Auto-merge: resolve conflicts for PR #$PR" 2>/dev/null; then
+              git push origin HEAD:"$HEAD_BRANCH"
+              echo "conflict=resolved" >> "$GITHUB_OUTPUT"
+            else
+              if git diff --name-only --diff-filter=U | grep -q .; then
+                echo "conflict=needs_resolution" >> "$GITHUB_OUTPUT"
+              else
+                git merge --abort 2>/dev/null || true
+                echo "conflict=aborted" >> "$GITHUB_OUTPUT"
+              fi
+            fi
+          fi
+
+      - name: Stop-Guard (> 10 PR-Commits)
+        id: stop-guard
+        if: steps.setup.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          PR: ${{ inputs.pr-number }}
+          REPO: ${{ github.repository }}
+        run: |
+          if ! commits="$(gh pr view "$PR" --repo "$REPO" --json commits --jq '.commits | length' 2>/dev/null)"; then
+            echo "stop=true" >> "$GITHUB_OUTPUT"
+            gh pr comment "$PR" --repo "$REPO" --body "🛑 Stop-Guard: gh-API nicht erreichbar – fail-closed." 2>/dev/null || true
+            exit 0
+          fi
+          if [ "${commits:-0}" -gt 10 ]; then
+            echo "stop=true" >> "$GITHUB_OUTPUT"
+            gh pr comment "$PR" --repo "$REPO" --body "🛑 **Stop-Guard: Fixup-Loop gestoppt** (${commits} Commits > 10). Bitte manuell prüfen." 2>/dev/null || true
+            exit 0
+          fi
+          echo "stop=false" >> "$GITHUB_OUTPUT"
+
+      # Kein Supersede-Check mehr: Die globale Phasen-Serialisierung (statische
+      # concurrency-Gruppe) lässt Fixup-Läufe desselben Branches nie parallel laufen, und der
+      # precheck dedupliziert über den Label-IST-Zustand. Ein Lauf-Listen-Guard würde hier nur
+      # noch queued Nachfolger finden und das FALSCHE Skip auslösen.
+
+      - name: HEAD vor Claude merken (Fortschritts-Baseline)
+        id: head-before
+        if: steps.setup.outputs.configured == 'true' && steps.stop-guard.outputs.stop != 'true'
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Findings umsetzen via Claude
+        id: claude
+        if: steps.setup.outputs.configured == 'true' && steps.stop-guard.outputs.stop != 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          PR: ${{ inputs.pr-number }}
+        run: |
+          cat > /tmp/claude-prompt.txt << 'CLAUDE_EOF'
+          FOKUS: NUR PR #PR_NR. NUR gemeldete Kritikpunkte beheben. KEINE Abstecher. Token sparen: kurz, präzise, direkt.
+
+          ABLAUF (STRIKT):
+            0. KONFLIKTAUFLÖSUNG (falls nötig): Prüfe mit git status und git diff --name-only --diff-filter=U auf Merge-Konflikte. Bei Konflikten: analysieren, eindeutig auflösen, git add, git commit, git push. Erst DANN mit Findings weitermachen.
+            1. SOFORT starten.
+            2. Findings lesen: gh pr view, gh pr diff, Review-Threads (gh api .../pulls/PR_NR/comments) und CI (gh pr checks).
+            3. Zutreffende, EINDEUTIGE Findings fixen:
+               - Code ändern, vor jedem Commit lokale Checks: pnpm format && pnpm exec prettier --check . && pnpm lint && pnpm knip.
+               - Erst wenn alle grün, committen und pushen.
+               - Im jeweiligen Thread antworten und auflösen.
+               - Mehrdeutige/große/Entscheidungs-Punkte NICHT fixen → stattdessen am Ende VERDICT: needs-human (der Mensch entscheidet).
+            4. CI-CHECKS BEHANDELN (falls rot):
+               a) FLAKY-TEST ERKENNEN: Timeout/Timing-Instabilität + thematisch keine Logik aus diesem PR-Diff? → FLAKY: einmalig via gh run rerun <failed-run-id> --failed neu starten. 60s warten, dann gh pr checks erneut prüfen.
+               b) ECHTER CI-FEHLER: Job-Log lesen, Root Cause identifizieren, Code ändern, lokale Checks ausführen, committen und pushen.
+               c) UNRELATED CI-FEHLER: In PR-Kommentar dokumentieren. Nicht fixen.
+
+          ABSCHLUSS:
+            - Committen+pushen ist der ECHTE Fortschritt: das Workflow misst HEAD-Bewegung (neue
+              Commits), um zu entscheiden, ob ein erneuter Review nötig ist. Ein "fertig"-Verdict
+              ohne Commit bewirkt NICHTS — der Workflow übergibt nur bei gerücktem HEAD an Review.
+            - VERDICT: needs-human NUR bei Entscheidungs-Findings (Architektur/Produkt/Design,
+              "Mensch entscheidet") — das ist das EINZIG verbindliche Verdict (terminal an Mensch).
+
+          ⚠️ LABELS: KEINE Labels setzen! Workflow übernimmt das automatisch.
+
+          VERDICT: GANZ AM ENDE GENAU EINE Zeile (nur bei Entscheidungs-Findungen):
+            - VERDICT: needs-human (offene Entscheidungs-Findings, die ein Mensch treffen muss)
+            - sonst: KEIN Verdict nötig — Commits entscheiden über Fortschritt, Review prüft neu.
+
+          ZEITLIMIT: Soft-Deadline = SOFT_DEADLINE. Vor jedem Schritt: [ $(date +%s) -ge SOFT_DEADLINE ]. Bei OVER: aktuellen Stand committen+pushen, Turn beenden.
+
+          Stop-Guard: Ein Workflow-Step zählt die PR-Commits und stoppt bei > 10.
+          CLAUDE_EOF
+
+          # Memory-Snippets anhängen (Phase 6: restauriert + schreibt).
+          # Override-Muster: lokale Konsumenten-Datei gewinnt, sonst der Pipeline-Default aus
+          # dem .agent-pipeline-Checkout (stellt setup-claude bereit).
+          MEMORY_READ=".github/prompts/memory-read.md"
+          [ -f "$MEMORY_READ" ] || MEMORY_READ=".agent-pipeline/.github/prompts/memory-read.md"
+          cat "$MEMORY_READ" >> /tmp/claude-prompt.txt
+          MEMORY_WRITE=".github/prompts/memory-write.md"
+          [ -f "$MEMORY_WRITE" ] || MEMORY_WRITE=".agent-pipeline/.github/prompts/memory-write.md"
+          cat "$MEMORY_WRITE" >> /tmp/claude-prompt.txt
+
+          sed -i "s/#PR_NR/${{ inputs.pr-number }}/g" /tmp/claude-prompt.txt
+          # #ISSUE_NR kommt aus memory-write.md (Dateiname der Phasen-Notiz). Ohne diese Zeile
+          # schrieb der Fixup seine Notiz in eine Datei mit LITERALEM Platzhalter im Namen.
+          sed -i "s/#ISSUE_NR/${{ steps.setup.outputs.issue-number }}/g" /tmp/claude-prompt.txt
+          sed -i "s/#PHASE/fixup/g" /tmp/claude-prompt.txt
+          sed -i "s/#MEMORY_STATUS/${{ steps.setup.outputs.memory-status-text }}/g" /tmp/claude-prompt.txt
+          sed -i "s/SOFT_DEADLINE/${{ steps.starttime.outputs.soft_deadline_epoch }}/g" /tmp/claude-prompt.txt
+
+          ${{ steps.setup.outputs.invoke-cmd }} "$(cat /tmp/claude-prompt.txt)" \
+            ${{ steps.setup.outputs.invoke-args }} \
+            2>&1 | tee /tmp/claude-output.log
+          test "${PIPESTATUS[0]}" -eq 0 || exit "${PIPESTATUS[0]}"
+
+      - name: Memory-Upload (das Artefakt IST der Speicher der Phasen-Notizen)
+        # Kein Cache-Save mehr — er ist für diese Pipeline platform-seitig unmöglich: GitHubs
+        # Richtlinie vom 2026-06-26 vergibt für Issue-/Label-/PR-Trigger UND die daraus
+        # kaskadierten workflow_run-Läufe nur lese-only Cache-Token. Der frühere Companion
+        # (claude-memory-save.yml) scheiterte deshalb in JEDEM Lauf still mit "cache write
+        # denied: token has no writable scopes" — als ##[warning], also bei grünem Job.
+        # Artefakte unterliegen dieser Restriktion nicht; die Folgephase holt sich das jüngste
+        # nicht-abgelaufene Artefakt dieses Namens (s. setup-claude, Step "Memory-Load").
+        # Name = claude-memory-issue-{N} (steps.setup.outputs.memory-save-key).
+        if: always() && steps.setup.outputs.configured == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.setup.outputs.memory-save-key }}
+          path: ${{ steps.setup.outputs.memory-path }}
+          # 14 Tage: das Artefakt ist jetzt der einzige Speicher, nicht mehr nur ein Transport-
+          # vehikel zum Cache (dort war 1 Tag genug). Muss den ganzen Ticket-Lebenszyklus
+          # überdauern; Phase 7 räumt am Ende ohnehin deterministisch auf. Größe: ~1 KB.
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Label-Post-Assertion (Labels via App-Token force-setzen)
+        id: label-post
+        # B1: Label-Transition auch bei Claude failure/cancelled — sonst bleibt der PR bei einem
+        # Crash/Timeout dauerhaft auf ai:needs-changes kleben (kein Re-Arm, keine Eskalation).
+        # Analog 05-claude-pr-review.yml (dort success|failure; hier zusaetzlich cancelled wg.
+        # timeout-minutes-Backstop). Skip-Reasons (stop-guard) liefern outcome=skipped und
+        # fallen hier korrekt raus.
+        if: always() && steps.setup.outputs.configured == 'true' && (steps.claude.outcome == 'success' || steps.claude.outcome == 'failure' || steps.claude.outcome == 'cancelled')
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          PR: ${{ inputs.pr-number }}
+          OUTCOME: ${{ steps.claude.outcome }}
+        run: |
+          verdict=""
+          if [ -f /tmp/claude-output.log ]; then
+            verdict="$(grep 'VERDICT:' /tmp/claude-output.log | tail -1 | sed -E 's/^.*VERDICT:[[:space:]]*//' | tr -d -c 'A-Za-z0-9-' || true)"
+          fi
+          echo "Claude-Verdict aus Output: '${verdict:-keins}'"
+
+          # Fortschritt = hat HEAD sich in DIESEM Lauf bewegt? Robust gg. amend/reset/force-push
+          # (jede HEAD-Bewegung = Arbeit; keine Bewegung = nichts getan) und self-contained
+          # (lokales Repo, keine API-/Marker-Abhaengigkeit). Das alte REVIEW_TS-Konstrukt fiel
+          # bei fehlendem Review-Marker auf Total-Commits zurueck und meldete Fortschritt, wo
+          # keiner war -> Review<->Fixup-Endlosloop (PR #524).
+          sha_before="${{ steps.head-before.outputs.sha }}"
+          sha_after="$(git rev-parse HEAD)"
+          echo "HEAD vor Claude: ${sha_before:-?} | nach Claude: ${sha_after:-?}"
+          ARTIFACTS_OK="false"
+          if [ -n "$sha_before" ] && [ "$sha_after" != "$sha_before" ]; then
+            ARTIFACTS_OK="true"
+          fi
+
+          gh label create "ai:needs-review" --repo "$GITHUB_REPOSITORY" --color FBCA04 2>/dev/null || true
+          gh label create "ai:needs-changes" --repo "$GITHUB_REPOSITORY" --color D93F0B 2>/dev/null || true
+          gh label create "ai:needs-human" --repo "$GITHUB_REPOSITORY" --color 5319e7 --description "Nicht-automatisierbare Entscheidung — wartet auf Mensch (Fixup greift bewusst nicht)" 2>/dev/null || true
+
+          # Trigger-Labels immer erst entfernen (Force-Set-Semantik).
+          gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --remove-label ai:needs-changes 2>/dev/null || true
+          gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --remove-label ai:needs-review 2>/dev/null || true
+
+          # B1: Claude abgestuerzt/abgebrochen (failure/cancelled) — kein vertrauenswuerdiges
+          # Verdict, HEAD-Fortschritt nicht aussagekraeftig (evtl. mittendrin abgebrochen).
+          # Terminal ai:needs-human + Kommentar, KEINE Re-Armierung: ein wiederholt abstuerzender
+          # Claude wuerde sonst eine Re-Arm-Schleife erzeugen. Review macht analog den Safe-Default.
+          if [ "$OUTCOME" != "success" ]; then
+            gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --add-label ai:needs-human
+            gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "🛑 **Fixup #${PR}: Claude-Schritt \`${OUTCOME}\`** — kein Verdict, HEAD-Fortschritt nach Absturz/Abbruch nicht vertrauenswuerdig. ai:needs-human gesetzt — bitte manuell pruefen (war es ein transienter API-Fehler, \`ai:needs-changes\` neu setzen und erneut fixupen lassen)." 2>/dev/null || true
+            echo "::warning::Claude-Schritt '${OUTCOME}' -> ai:needs-human (keine Re-Armierung, Mensch prueft)."
+            echo "stuck=true" >> "$GITHUB_OUTPUT"
+            echo "stuck_reason=crash" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # B2: Verdict ist beratend — EINZIG `needs-human` ist verbindlich (terminal). Fortschritt
+          # entscheidet der Workflow ausschliesslich ueber HEAD-Bewegung (Commits = Ground Truth),
+          # niemals ueber ein `fixup-complete`-Verdict. Vgl. Prompt-Vertrag (VERDICT-Abschnitt).
+          if [ "$verdict" = "needs-human" ]; then
+            # Claude hat erkannt: verbleibende Findings sind Entscheidungs-Findings, die ein Mensch
+            # treffen muss (kein automatisierbarer Fix). Terminal an Mensch — kein Re-Arm, kein Loop.
+            gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --add-label ai:needs-human
+            echo "::notice::Verdict needs-human -> Label gesetzt: ai:needs-human (wartet auf Mensch)."
+            gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "⏸️ **Wartet auf menschliche Entscheidung** — verbleibende Findings sind nicht automatisierbar (Architektur-/Produkt-/Designentscheidung, siehe Review-Threads). Der Fixup kann hier nicht weiterhelfen. Nach der Entscheidung: Label \`ai:needs-human\` entfernen und via \`ai:needs-review\` neu triggern." 2>/dev/null || true
+            echo "stuck=true" >> "$GITHUB_OUTPUT"
+            echo "stuck_reason=needs-human" >> "$GITHUB_OUTPUT"
+          elif [ "$ARTIFACTS_OK" = "true" ]; then
+            # Fortschritt -> an Review uebergeben. Konvergiert via Stop-Guard (>10 Commits),
+            # falls Review nie gruen wird.
+            gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --add-label ai:needs-review
+            echo "::notice::Fortschritt erkannt (HEAD bewegt) -> Label gesetzt: ai:needs-review"
+            echo "stuck=false" >> "$GITHUB_OUTPUT"
+          else
+            # KEIN Fortschritt und kein klares needs-human-Verdict -> NICHT erneut triggern (kappt
+            # sowohl Fixup<->Fixup- als auch Review<->Fixup-Endlosloop). Terminal an Mensch via
+            # ai:needs-human (vermutlich doch ein nicht-automatisierbarer Blocker) + Kommentar.
+            gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --add-label ai:needs-human
+            gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "🛑 **Fixup #${PR} ohne Fortschritt** — kein neuer Commit in diesem Lauf (HEAD unverändert). Vermutlich ein nicht-automatisierbares Finding. ai:needs-human gesetzt — bitte manuell prüfen (ggf. entscheiden und \`ai:needs-review\` neu setzen)." 2>/dev/null || true
+            echo "::warning::Kein Fixup-Fortschritt (HEAD unverändert) -> ai:needs-human, keine Re-Armierung, Mensch prüft."
+            echo "stuck=true" >> "$GITHUB_OUTPUT"
+            echo "stuck_reason=no-progress" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ergebnis zusammenfassen
+        if: always() && steps.setup.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          PR: ${{ inputs.pr-number }}
+          OUTCOME: ${{ steps.claude.outcome }}
+          STOP_GUARD: ${{ steps.stop-guard.outputs.stop }}
+          STUCK: ${{ steps.label-post.outputs.stuck }}
+          STUCK_REASON: ${{ steps.label-post.outputs.stuck_reason }}
+        run: |
+          labels="$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json labels --jq '[.labels[].name] | join(", ")' 2>/dev/null || true)"
+          # Eigener Arm fuer den Stop-Guard: ohne ihn faellt der gewollte Abbruch auf den
+          # Fehler-Arm (OUTCOME ist leer, weil der claude-Step nie lief) und meldet ❌.
+          # Der Stop-Guard ist ein GEWOLLTER Abbruch (Loop-Schutz, > 10 Commits) — er hat
+          # bereits selbst kommentiert; hier gehoert eine Warnung hin, kein Fehler.
+          # Dasselbe gilt fuer den No-Progress-Fall (STUCK): Claude lief, aber ohne Commit ->
+          # bewusst keine Re-Armierung, Mensch prüft.
+          if [ "${STOP_GUARD:-false}" = "true" ]; then
+            echo "::warning title=🛑 Fixup gestoppt::PR #${PR} — Stop-Guard (Loop-Schutz), bitte manuell prüfen"
+          elif [ "${STUCK:-false}" = "true" ]; then
+            # STUCK=true kommt von drei Pfaden (stuck_reason): Claude-Crash (OUTCOME!=success),
+            # needs-human-Verdict ODER echtem No-Progress. Jeder braucht seine eigene Wahrheit:
+            # beim Crash ist der HEAD-Fortschritt nicht vertrauenswuerdig, bei needs-human wartet
+            # der PR auf eine menschliche Entscheidung (Claude kann trotzdem Commits gemacht
+            # haben — "kein neuer Commit" waere hier falsch), bei No-Progress gab es wirklich keinen.
+            case "${STUCK_REASON:-no-progress}" in
+              crash)
+                echo "::warning title=🛑 Fixup abgestürzt/abgebrochen::PR #${PR} — Claude-Schritt \`${OUTCOME:-unbekannt}\`, HEAD-Fortschritt nicht vertrauenswürdig, keine Re-Armierung, bitte manuell prüfen"
+                ;;
+              needs-human)
+                echo "::notice title=⏸️ Fixup wartet auf Entscheidung::PR #${PR} — verbleibende Findings nicht automatisierbar (ai:needs-human gesetzt), bitte manuell prüfen"
+                ;;
+              *)
+                echo "::warning title=🛑 Fixup ohne Fortschritt::PR #${PR} — kein neuer Commit, keine Re-Armierung, bitte manuell prüfen"
+                ;;
+            esac
+          elif [ "$OUTCOME" = "success" ]; then
+            echo "::notice title=✅ Fixup erfolgreich::PR #${PR}"
+          elif [ "$OUTCOME" = "cancelled" ]; then
+            echo "::warning title=⏸️ Fixup abgebrochen"
+          else
+            echo "::error title=❌ Fixup fehlgeschlagen"
+          fi
+          {
+            echo "### Fixup #${PR}"
+            echo "- Claude-Schritt: \`${OUTCOME:-unbekannt}\`"
+            echo "- Labels: ${labels:-keine}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 🩺 Z.AI Fair-Usage-Check (1313)
+        # Rohausgabe des Claude-Laufs auf z.ai-Fehler 1313 (Fair Usage) durchsuchen
+        # und Ergebnis als Annotation + Job-Summary sichtbar machen.
+        if: always()
+        uses: deleonio/agent-pipeline/.github/actions/llm-fair-usage-check@v1.0

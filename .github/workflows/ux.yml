@@ -1,0 +1,245 @@
+# Callee (workflow_call) der Phase 2/7 UX-Beratung (Quelle: 02-claude-ux.yml) — aufgerufen vom
+# Stub stubs/02-claude-ux.yml im Konsumenten-Repo via
+# `uses: deleonio/agent-pipeline/.github/workflows/ux.yml@v1.0`.
+# Event-Fakten-Filter (dispatch ODER Label ai:spec-ready) und concurrency (queue: max) leben
+# im Stub. Hinweis: Stub-Name/Dateiname ist Vertrag (gate-merge/Sweep matchen sie).
+
+name: 2/7 UX-Beratung (Callee)
+
+on:
+  workflow_call:
+    inputs:
+      issue-number:
+        description: 'Issue-Nummer (vom Stub aufgeloest: Event-Issue oder dispatch-Input)'
+        required: true
+        type: string
+      node-version-file:
+        description: 'Pfad zur Node-Version-Datei (z. B. .nvmrc); leer = kein Node-Setup'
+        required: false
+        default: ''
+        type: string
+      install-command:
+        description: 'Shell-Befehl fuer das Projekt-Setup (z. B. corepack enable && pnpm install ... && lefthook install); leer = kein Setup'
+        required: false
+        default: ''
+        type: string
+    secrets:
+      APP_ID:
+        required: false
+      APP_PRIVATE_KEY:
+        required: false
+      ZAI_API_KEY:
+        required: false
+      CLAUDE_API_KEY:
+        required: false
+      OPENROUTER_API_KEY:
+        required: false
+      TAILSCALE_AUTH_KEY:
+        required: false
+
+jobs:
+  precheck:
+    # [Konvertierung: Das Event-if (workflow_dispatch ODER Label ai:spec-ready) ist als job-if
+    #  in den Stub gewandert; die Issue-Nummer-Auflösung (Event vs. dispatch-Input) ebenfalls —
+    #  der Stub reicht sie als input issue-number durch. github.event_name ist caller-assoziert
+    #  und unterscheidet hier weiterhin issues vs. workflow_dispatch.]
+    # Bei workflow_dispatch immer laufen, sonst nur bei Label ai:spec-ready
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      # `|| `-Fallback: bei workflow_dispatch ist der `check`-Step übersprungen (leerer
+      # Output) und proceed kommt aus check-dispatch — ohne Fallback wäre der manuelle
+      # Dispatch (der Recovery-Pfad für ux:failed) stumm tot.
+      proceed: ${{ steps.check.outputs.proceed || steps.check-dispatch.outputs.proceed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Label-Pre-Check (ai:spec-ready muss vorhanden sein)
+        id: check
+        if: ${{ github.event_name == 'issues' }}
+        uses: deleonio/agent-pipeline/.github/actions/check-phase-label@v1.0
+        with:
+          phase: ux
+          ticket: ${{ inputs.issue-number }}
+
+      - name: Für workflow_dispatch immer proceed=true
+        id: check-dispatch
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: echo "proceed=true" >> "$GITHUB_OUTPUT"
+
+  ux:
+    needs: precheck
+    if: >-
+      ${{ always()
+          && (needs.precheck.outputs.proceed == 'true' || needs.precheck.result == 'failure') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    permissions:
+      contents: read
+      id-token: write
+      actions: write
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Startzeit merken
+        id: starttime
+        run: |
+          now=$(date +%s)
+          echo "epoch=$now" >> "$GITHUB_OUTPUT"
+          echo "soft_deadline_epoch=$((now + 840))" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Claude Code (mit Memory-Load)
+        id: setup
+        uses: deleonio/agent-pipeline/.github/actions/setup-claude@v1.0
+        with:
+          needs-mcp: false
+          tools-tier: full
+          event-type: ${{ github.event_name }}
+          ticket-ref: ${{ inputs.issue-number }}
+          app-id: ${{ secrets.APP_ID }}
+          app-private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          llm-provider: ${{ vars.LLM_PROVIDER }}
+          model: ${{ vars.CLAUDE_MODEL_SPEC || 'sonnet' }}
+          zai-api-key: ${{ secrets.ZAI_API_KEY }}
+          claude-api-key: ${{ secrets.CLAUDE_API_KEY }}
+          openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
+          zai-settings-json: ${{ vars.CLAUDE_CODE_SETTINGS_LOCAL_ZAI }}
+          openrouter-settings-json: ${{ vars.CLAUDE_CODE_SETTINGS_LOCAL_OPENROUTER }}
+          tailscale-authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          tailscale-exit-node: ${{ vars.TAILSCALE_EXIT_NODE }}
+          memory-load: 'true'
+          expect-memory: 'false'
+
+      - name: agent-pipeline Version
+        if: steps.setup.outputs.configured == 'true'
+        env:
+          PIPELINE_SHA: ${{ steps.setup.outputs.pipeline-sha }}
+        run: |
+          echo "::notice title=agent-pipeline::Ref v1.0${PIPELINE_SHA:+ @ ${PIPELINE_SHA:0:12}}"
+          echo "- agent-pipeline: v1.0${PIPELINE_SHA:+ @ ${PIPELINE_SHA:0:12}}" >> "$GITHUB_STEP_SUMMARY"
+
+      # Ersetzt die Quell-Steps pnpm/action-setup + setup-node(.nvmrc, cache: pnpm) +
+      # pnpm install --frozen-lockfile + lefthook install — konfiguriert via Stub
+      # (node-version-file / install-command).
+      - name: Node-Setup (falls konfiguriert)
+        if: inputs.node-version-file != ''
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version-file: ${{ inputs.node-version-file }}
+
+      - name: Projekt-Setup (install-command)
+        if: inputs.install-command != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -c "${{ inputs.install-command }}"
+
+      - name: UX-Beratung via Claude
+        id: claude
+        if: steps.setup.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          ISSUE: ${{ inputs.issue-number }}
+        run: |
+          # Prompt: lokale Konsumenten-Datei gewinnt, Fallback zentral (.agent-pipeline).
+          PROMPT=".github/prompts/ux.md"
+          [ -f "$PROMPT" ] || PROMPT=".agent-pipeline/.github/prompts/ux.md"
+          sed -e "s/#ISSUE_NR/${{ inputs.issue-number }}/g" \
+              -e "s/SOFT_DEADLINE/${{ steps.starttime.outputs.soft_deadline_epoch }}/g" \
+              "$PROMPT" > /tmp/claude-prompt.txt
+
+          # Memory-Snippets anhängen (Phase 2: restauriert + schreibt).
+          # Override-Muster: lokale Konsumenten-Datei gewinnt, Fallback zentral (.agent-pipeline).
+          PROMPT=".github/prompts/memory-read.md"
+          [ -f "$PROMPT" ] || PROMPT=".agent-pipeline/.github/prompts/memory-read.md"
+          cat "$PROMPT" >> /tmp/claude-prompt.txt
+          PROMPT=".github/prompts/memory-write.md"
+          [ -f "$PROMPT" ] || PROMPT=".agent-pipeline/.github/prompts/memory-write.md"
+          cat "$PROMPT" >> /tmp/claude-prompt.txt
+          sed -i "s/#ISSUE_NR/${{ inputs.issue-number }}/g" /tmp/claude-prompt.txt
+          sed -i "s/#PHASE/ux/g" /tmp/claude-prompt.txt
+          sed -i "s/#MEMORY_STATUS/${{ steps.setup.outputs.memory-status-text }}/g" /tmp/claude-prompt.txt
+
+          ${{ steps.setup.outputs.invoke-cmd }} "$(cat /tmp/claude-prompt.txt)" \
+            ${{ steps.setup.outputs.invoke-args }} \
+            2>&1 | tee /tmp/claude-output.log
+          test "${PIPESTATUS[0]}" -eq 0 || exit "${PIPESTATUS[0]}"
+
+      - name: Memory-Upload
+        if: always() && steps.setup.outputs.configured == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ steps.setup.outputs.memory-save-key }}
+          path: ${{ steps.setup.outputs.memory-path }}
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Label-Post-Assertion (VERDICT parsen, ux:ready setzen)
+        if: always() && steps.setup.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          ISSUE: ${{ inputs.issue-number }}
+        run: |
+          verdict=""
+          if [ -f /tmp/claude-output.log ]; then
+            verdict="$(grep 'VERDICT:' /tmp/claude-output.log | tail -1 | sed -E 's/^.*VERDICT:[[:space:]]*//' | tr -d -c 'A-Za-z0-9-' || true)"
+          fi
+          echo "Claude-Verdict aus Output: '${verdict:-keins}'"
+
+          gh label create "ux:ready" --repo "$GITHUB_REPOSITORY" --color 0E8A16 2>/dev/null || true
+          gh label create "ux:failed" --repo "$GITHUB_REPOSITORY" --color d73a49 2>/dev/null || true
+
+          # ux:ready/ux:failed werden gemanagt (Idempotenz: remove-vor-add).
+          # ai:spec-ready gehört der Spec-Phase — NICHT hier entfernen.
+          gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --remove-label "ux:ready" 2>/dev/null || true
+          gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --remove-label "ux:failed" 2>/dev/null || true
+
+          if [ "$verdict" = "ux-ready" ]; then
+            gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --add-label "ux:ready"
+            echo "::notice::Label gesetzt: ux:ready"
+          elif [ "$verdict" = "ux-not-ready" ]; then
+            gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --add-label "ux:failed"
+            # Recovery-Wegweiser (fail-safe beim Menschen, aber nicht stumm): Bot-Kommentar
+            # triggert nichts — Labels sind der einzige Ketten-Trigger.
+            gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" --body \
+              "⚠️ UX-Beratung unklar (\`ux:failed\`) — die Kette wartet. Nach Klärung: *2/7 UX-Beratung* in der Actions-UI erneut anstoßen (Run workflow, Issue-Nummer angeben) oder bei unerheblichem UX-Blocker \`ux:ready\` manuell setzen; die Spec-Phase startet dann." 2>/dev/null || true
+            echo "::notice::Label gesetzt: ux:failed"
+          else
+            echo "::warning::Kein VERDICT im Output – kein Label gesetzt"
+          fi
+
+      - name: Ergebnis zusammenfassen
+        if: always() && steps.setup.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          ISSUE: ${{ inputs.issue-number }}
+          OUTCOME: ${{ steps.claude.outcome }}
+        run: |
+          labels="$(gh issue view "$ISSUE" --repo "$GITHUB_REPOSITORY" --json labels --jq '[.labels[].name] | join(", ")' 2>/dev/null || true)"
+          if [ "$OUTCOME" = "success" ]; then
+            echo "::notice title=✅ UX-Beratung erfolgreich::Issue #${ISSUE}"
+          elif [ "$OUTCOME" = "cancelled" ]; then
+            echo "::warning title=⏸️ UX-Beratung abgebrochen"
+          else
+            echo "::error title=❌ UX-Beratung fehlgeschlagen"
+          fi
+          {
+            echo "### UX-Beratung #${ISSUE} – fertig"
+            echo "- Claude-Schritt: \`${OUTCOME:-unbekannt}\`"
+            echo "- Labels: ${labels:-keine}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 🩺 Z.AI Fair-Usage-Check (1313)
+        if: always()
+        uses: deleonio/agent-pipeline/.github/actions/llm-fair-usage-check@v1.0

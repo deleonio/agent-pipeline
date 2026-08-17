@@ -1,0 +1,462 @@
+# Callee: Phase 5 (Review) als wiederverwendbarer workflow_call-Workflow — mechanisch
+# konvertiert aus priority-pilot/.github/workflows/05-claude-pr-review.yml (7-Phasen-Stand).
+# Consumer-Stub: stubs/05-claude-pr-review.yml ("5/7 Review") — Trigger (pull_request labeled),
+# Label-Filter ai:needs-review, FORK-GUARD und Concurrency (claude-pr-review) leben IM STUB;
+# der Callee trägt bewusst KEIN workflow-concurrency. Vertrag: Event-Payload nur via inputs
+# (Ausnahme: "5/7 Review" bleibt im jq-Filter LITERAL — eigener Name = Stub-Vertrag).
+
+on:
+  workflow_call:
+    inputs:
+      pr-number:
+        description: 'PR-Nummer (Stub reicht github.event.pull_request.number durch)'
+        required: true
+        type: string
+      ci-workflow-name:
+        description: 'Workflow-Name der verpflichtenden CI im gh-pr-checks-Allowlist-Urteil (Stub-Default: "CI")'
+        required: false
+        type: string
+        default: 'CI'
+    secrets:
+      APP_ID:
+        required: false
+      APP_PRIVATE_KEY:
+        required: false
+      ZAI_API_KEY:
+        required: false
+      CLAUDE_API_KEY:
+        required: false
+      OPENROUTER_API_KEY:
+        required: false
+      TAILSCALE_AUTH_KEY:
+        required: false
+
+jobs:
+  precheck:
+    # Unveränderliche Event-Fakten (Label-Filter ai:needs-review + FORK-GUARD) filtert jetzt
+    # der STUB im job-if — weiterhin VOR jedem Callee-Step, denn der Fork-Guard ist an dieser
+    # Stelle sicherheitsrelevant: `actions/checkout` holt bei pull_request den Merge-Ref, also
+    # PR-Code, und die Action samt Skript würde daraus ausgeführt. Stünde der Guard erst am
+    # Hauptjob, führte ein Fork-PR mit manipuliertem check-phase-label.sh eigenen Bash aus,
+    # sobald irgendjemand ein Label setzt. Vor dieser Umstellung gab es für Fork-PRs gar keinen
+    # Checkout in 04.
+    # Label-IST-Zustand zur Laufzeit: ai:needs-review muss JETZT (nach dem Warten in der
+    # globalen Phasen-Queue) noch am PR kleben und der PR offen + nicht-draft sein.
+    # Soll-Werte stehen zentral in .github/scripts/check-phase-label.sh; hier wird nur der
+    # Phasen-Name übergeben.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read # lokale Action + Skript auschecken
+      pull-requests: read
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Label-Pre-Check (IST-Zustand zur Laufzeit)
+        id: check
+        uses: deleonio/agent-pipeline/.github/actions/check-phase-label@v1.0
+        with:
+          phase: review
+          ticket: ${{ inputs.pr-number }}
+
+  review:
+    needs: precheck
+    # `result == 'failure'` ist FAIL-OPEN und beabsichtigt: das Skript fällt bei API-Fehlern
+    # bewusst auf "laufen lassen" zurück, aber ein Fehler AUSSERHALB (Checkout, Timeout,
+    # Runner-Ausfall) würde den Hauptjob sonst stumm überspringen — Trigger konsumiert, niemand
+    # arbeitet, nichts re-armt. Ein übersprungener precheck (result == 'skipped', No-op-Trigger
+    # ODER Fork-PR) erfüllt keine der beiden Klauseln und lässt den Hauptjob korrekt entfallen —
+    # der Fork-Guard aus dem Stub-job-if wirkt dadurch weiterhin auch für den Hauptjob.
+    if: >-
+      ${{ always()
+          && (needs.precheck.outputs.proceed == 'true' || needs.precheck.result == 'failure') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    permissions:
+      contents: read
+      id-token: write
+      actions: write
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Startzeit merken (für weiches Zeitlimit)
+        id: starttime
+        run: |
+          now=$(date +%s)
+          echo "epoch=$now" >> "$GITHUB_OUTPUT"
+          echo "soft_deadline_epoch=$((now + 600))" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Claude Code (mit Memory-Load)
+        id: setup
+        uses: deleonio/agent-pipeline/.github/actions/setup-claude@v1.0
+        with:
+          needs-mcp: false
+          tools-tier: review
+          event-type: ${{ github.event_name }}
+          ticket-ref: ${{ inputs.pr-number }}
+          app-id: ${{ secrets.APP_ID }}
+          app-private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          llm-provider: ${{ vars.LLM_PROVIDER }}
+          model: ${{ vars.CLAUDE_MODEL_PR_REVIEW || 'opus' }}
+          zai-api-key: ${{ secrets.ZAI_API_KEY }}
+          claude-api-key: ${{ secrets.CLAUDE_API_KEY }}
+          openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
+          zai-settings-json: ${{ vars.CLAUDE_CODE_SETTINGS_LOCAL_ZAI }}
+          openrouter-settings-json: ${{ vars.CLAUDE_CODE_SETTINGS_LOCAL_OPENROUTER }}
+          tailscale-authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          tailscale-exit-node: ${{ vars.TAILSCALE_EXIT_NODE }}
+          memory-load: 'true'
+          expect-memory: 'true'
+
+      - name: agent-pipeline Version
+        if: steps.setup.outputs.configured == 'true'
+        env:
+          PIPELINE_SHA: ${{ steps.setup.outputs.pipeline-sha }}
+        run: |
+          echo "::notice title=agent-pipeline::Ref v1.0${PIPELINE_SHA:+ @ ${PIPELINE_SHA:0:12}}"
+          echo "- agent-pipeline: v1.0${PIPELINE_SHA:+ @ ${PIPELINE_SHA:0:12}}" >> "$GITHUB_STEP_SUMMARY"
+
+      # Kein Supersede-Check mehr: Die globale Phasen-Serialisierung (statische
+      # concurrency-Gruppe) lässt Review-Läufe desselben Branches nie parallel laufen, und der
+      # precheck dedupliziert über den Label-IST-Zustand. Neu-Triggern bei menschlichem Push
+      # übernimmt der Autolabeler (cancel + Neu-Setzen von ai:needs-review).
+
+      - name: 🔍 Titel-Fakten deterministisch erheben
+        # Conventional-Commits-Prüfung des PR-Titels VOR dem Merge (Regel-Logik, s.
+        # pr-doc-facts.sh --mode title-only im Pipeline-Repo). Post-Merge-Umbenennen im
+        # Documenter ist nur noch Backstop — der Merge-Commit-Subject steht dann schon.
+        # Bewusst KEIN eigener CI-Check-Job: ein roter Check setzt ai:needs-changes →
+        # Fixup läuft → Titelkorrektur erzeugt keinen Commit → No-Progress-Erkennung
+        # schlägt zu → ai:needs-human. Sackgasse; der Reviewer hat gh + vollen Kontext.
+        id: facts
+        if: steps.setup.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ inputs.pr-number }}
+        run: |
+          bash .agent-pipeline/.github/scripts/pr-doc-facts.sh --repo "$REPO" --pr "$PR" --mode title-only >> "$GITHUB_OUTPUT"
+
+      - name: Kreuzverhör-Review via Claude
+        id: claude
+        if: steps.setup.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          PR: ${{ inputs.pr-number }}
+        run: |
+          cat > /tmp/claude-prompt.txt << 'CLAUDE_EOF'
+          HINWEIS: Review-Tier — du liest UND schreibst Memory (issue-spezifische Notizen in .claude/memory; Details siehe Memory-Abschnitte am Prompt-Ende). Code bleibt tabu.
+          FOKUS: NUR PR #PR_NR. NUR den Diff prüfen. KEINE Abstecher. Token sparen: kurz, präzise, direkt.
+
+          MODUS bestimmen (ALLERERSTER Schritt): Prüfe, ob bereits ein <!-- ai-review -->-Sammelkommentar am PR existiert (gh api repos/{owner}/{repo}/issues/#PR_NR/comments, nach "<!-- ai-review -->" filtern).
+            - Marker FEHLT → MODUS = KREUZVERHÖR (Erst-Review: volle adversariale Prüfung des ganzen PR).
+            - Marker VORHANDEN → MODUS = FIXUP-NACHWEIS (Folge-Review nach Fixup: KEIN neues Kreuzverhör — nur Kreuzverhör-Ergebnis + Fixup-Runden prüfen).
+
+          MODUS KREUZVERHÖR (Erst-Review) — adversarial, ganzer PR:
+            1. Vollständigen Diff (gh pr diff) und verknüpftes Ticket lesen (AK aus Body-Block <!-- KI-ANALYSE:START/END -->).
+            2. Adversarial prüfen: Löst der PR das Problem ganz? Edge Cases? Einfachster Weg? Performance/Security?
+               Regression: macht der PR bestehende Tests/Verhalten AUSSERHALB des Diffs obsolet? (Obsolete Tests sollten schon in der Spec entfernt sein; falls Widerspruch → Finding "Test-Pflege-Bedarf", Datei:Zeile.)
+            3. Code-Qualität: Benennung, Lesbarkeit, Tests (grün + AK abdeckend).
+
+          MODUS FIXUP-NACHWEIS (Folge-Review) — NUR das Kreuzverhör-Ergebnis + die Fixup-Runden, NICHT erneut der ganze PR:
+            1. Bestehenden <!-- ai-review -->-Kommentar laden, seine "Offenen Findings" + updatedAt notieren.
+            2. Fixup-Diff seit updatedAt: gh pr view --json commits, committedDate > updatedAt filtern, darauf git diff.
+            3. Pro offenem Finding: durch den Fixup behoben (Datei/Zeile verifizieren)? → als behoben markieren, sonst offen lassen — nicht erneut aufrollen.
+            4. NUR den Fixup-Diff adversarial auf NEUE Probleme prüfen (hat der Fix neue Bugs/Regressionen eingeführt?).
+            5. AK/Ticket-Kontext im Blick behalten (nicht rein diff-lokal urteilen), aber unveränderte Code-Teile NICHT erneut kreuzvernehmen.
+
+          ABSCHLUSS (beide Modi):
+            - TITEL-GATE (VOR dem Verdict): TITLE_OK sagt, ob der PR-Titel Conventional Commits erfüllt (type(scope)!: subject, englisch, Subject klein, <=72). Bei false: via gh pr edit #PR_NR --title umbenennen — Typ/Scope-Anhaltspunkte SUGGESTED_TYPE/SUGGESTED_SCOPE, Subject englisch beschreibend. Kein Finding, kein Verdict-Aufschub.
+            - (Fixbare) Findings → Review-Kommentare an Datei/Zeile, dann VERDICT: needs-changes
+            - Architektur-/Produkt-/Design-Finding ("Mensch entscheidet") → Kommentar mit Handlungsoptionen, dann VERDICT: needs-human
+            - solide (🟢) → KEINE Pseudo-Findings, knappe 🟢-Bestätigung, dann VERDICT: ready-to-merge
+
+          Sammelkommentar: Urteil als GENAU EINEN <!-- ai-review -->-Kommentar pflegen (vorhandenen suchen + fortschreiben, nicht neu anlegen). Zwei Abschnitte: "Offene Findings" (aktuelle Runde) und "Behobene Anmerkungen" (History-Tabelle — erledigte Findings wandern dorthin).
+
+          ⚠️ LABELS: KEINE Labels setzen! Workflow übernimmt das automatisch.
+
+          ZEITLIMIT: Soft-Deadline = SOFT_DEADLINE. Vor jedem Schritt: [ $(date +%s) -ge SOFT_DEADLINE ]. Bei OVER: Zwischenstand als Sammelkommentar, Turn beenden.
+
+          WICHTIG: Ändere KEINEN Code, committe nichts. Reiner Review.
+
+          VERDICT (DEINE LETZTE OUTPUT-ZEILE, vom Workflow geparsed — ohne sie bleibt der PR stecken): exakt EINE Zeile am Ende, einer der Werte:
+            - VERDICT: ready-to-merge (bei 🟢)
+            - VERDICT: needs-changes (bei fixbaren Findings)
+            - VERDICT: needs-human (bei Entscheidungs-Findungen, die ein Mensch treffen muss)
+          CLAUDE_EOF
+
+          # Memory-Snippets anhängen (Phase 5 = Review: restauriert + schreibt Review-Notizen;
+          # #ISSUE_NR aus dem Setup-Output, da dieser Workflow am PR hängt, nicht am Issue).
+          # Override-Muster: lokale Konsumenten-Datei gewinnt, sonst der Pipeline-Default aus
+          # dem .agent-pipeline-Checkout (stellt setup-claude bereit).
+          MEMORY_READ=".github/prompts/memory-read.md"
+          [ -f "$MEMORY_READ" ] || MEMORY_READ=".agent-pipeline/.github/prompts/memory-read.md"
+          cat "$MEMORY_READ" >> /tmp/claude-prompt.txt
+          MEMORY_WRITE=".github/prompts/memory-write.md"
+          [ -f "$MEMORY_WRITE" ] || MEMORY_WRITE=".agent-pipeline/.github/prompts/memory-write.md"
+          cat "$MEMORY_WRITE" >> /tmp/claude-prompt.txt
+
+          sed -i "s/#PR_NR/${{ inputs.pr-number }}/g" /tmp/claude-prompt.txt
+          sed -i "s/#ISSUE_NR/${{ steps.setup.outputs.issue-number }}/g" /tmp/claude-prompt.txt
+          sed -i "s/#PHASE/review/g" /tmp/claude-prompt.txt
+          sed -i "s/TITLE_OK/${{ steps.facts.outputs.title_ok || 'unbekannt' }}/g" /tmp/claude-prompt.txt
+          sed -i "s/SUGGESTED_TYPE/${{ steps.facts.outputs.suggested_type || 'chore' }}/g" /tmp/claude-prompt.txt
+          sed -i "s/SUGGESTED_SCOPE/${{ steps.facts.outputs.suggested_scope || 'k.A.' }}/g" /tmp/claude-prompt.txt
+          sed -i "s/#MEMORY_STATUS/${{ steps.setup.outputs.memory-status-text }}/g" /tmp/claude-prompt.txt
+          sed -i "s/SOFT_DEADLINE/${{ steps.starttime.outputs.soft_deadline_epoch }}/g" /tmp/claude-prompt.txt
+
+          ${{ steps.setup.outputs.invoke-cmd }} "$(cat /tmp/claude-prompt.txt)" \
+            ${{ steps.setup.outputs.invoke-args }} \
+            2>&1 | tee /tmp/claude-output.log
+          test "${PIPESTATUS[0]}" -eq 0 || exit "${PIPESTATUS[0]}"
+
+      - name: Memory-Upload (das Artefakt IST der Speicher der Phasen-Notizen)
+        # Kein Cache-Save mehr — er ist für diese Pipeline platform-seitig unmöglich: GitHubs
+        # Richtlinie vom 2026-06-26 vergibt für Issue-/Label-/PR-Trigger UND die daraus
+        # kaskadierten workflow_run-Läufe nur lese-only Cache-Token. Der frühere Companion
+        # (claude-memory-save.yml) scheiterte deshalb in JEDEM Lauf still mit "cache write
+        # denied: token has no writable scopes" — als ##[warning], also bei grünem Job.
+        # Artefakte unterliegen dieser Restriktion nicht; die Folgephase holt sich das jüngste
+        # nicht-abgelaufene Artefakt dieses Namens (s. setup-claude, Step "Memory-Load").
+        # Name = claude-memory-issue-{N} (steps.setup.outputs.memory-save-key).
+        if: always() && steps.setup.outputs.configured == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.setup.outputs.memory-save-key }}
+          path: ${{ steps.setup.outputs.memory-path }}
+          # 14 Tage: das Artefakt ist jetzt der einzige Speicher, nicht mehr nur ein Transport-
+          # vehikel zum Cache (dort war 1 Tag genug). Muss den ganzen Ticket-Lebenszyklus
+          # überdauern; Phase 7 räumt am Ende ohnehin deterministisch auf. Größe: ~1 KB.
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Label-Post-Assertion (Labels via App-Token force-setzen)
+        if: always() && steps.setup.outputs.configured == 'true' && (steps.claude.outcome == 'success' || steps.claude.outcome == 'failure')
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          PR: ${{ inputs.pr-number }}
+          CI_NAME: ${{ inputs.ci-workflow-name }}
+        run: |
+          verdict=""
+          if [ -f /tmp/claude-output.log ]; then
+            verdict="$(grep 'VERDICT:' /tmp/claude-output.log | tail -1 | sed -E 's/^.*VERDICT:[[:space:]]*//' | tr -d -c 'A-Za-z0-9-' || true)"
+          fi
+          echo "Claude-Verdict aus Output: '${verdict:-keins}'"
+
+          # Review-Marker (<!-- ai-review -->) nachsehen — MIT Retry: unmittelbar nach Claudes Post
+          # liefert die GitHub-API den Kommentar (Replikationsverzögerung) gelegentlich noch nicht.
+          # Ohne Retry endete der Review hier fälschlich ❌, obwohl Claude Verdict + Kommentar
+          # geliefert hatte (PR #524: Review↔Fixup-Loop).
+          ARTIFACTS_OK="false"
+          for attempt in 1 2 3 4; do
+            REVIEW_COMMENT_ID="$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json comments \
+              --jq '[.comments[] | select(.body | test("<!-- ai-review -->"))] | first | .id' 2>/dev/null || echo "")"
+            if [ -n "$REVIEW_COMMENT_ID" ] && [ "$REVIEW_COMMENT_ID" != "null" ]; then
+              ARTIFACTS_OK="true"
+              break
+            fi
+            [ "$attempt" -lt 4 ] && sleep "$attempt"
+          done
+
+          if [ "$ARTIFACTS_OK" != "true" ]; then
+            # Marker auch nach Retry nicht gefunden. Nur ein harter Fehler, wenn Claude KEIN klares
+            # Verdict lieferte (dann fehlt jeder Artefakt-Nachweis — Claude hat vermutlich nicht
+            # gearbeitet). Bei klarem Verdict ist der Kommentar ein Hilfssignal, das Verdict primär:
+            # wir setzen das Label nach Verdict und warnen nur. Ohne diese Unterscheidung würde ein
+            # fehlender Marker ein klares ready-to-merge zu needs-changes degradieren und einen
+            # Fixup-Loop auslösen (PR #524: Claude postete teils keinen Marker-Kommentar).
+            case "$verdict" in
+              ready-to-merge|needs-changes|needs-human)
+                echo "::warning title=Review-Kommentar fehlt::Kein <!-- ai-review -->-Kommentar am PR (auch nach Retry). Claude-Verdict '${verdict}' ist klar → Label nach Verdict, kein harter Fehler. Marker wird vom Workflow angelegt."
+                # Create-or-Update (#530): Claude postet den Sammelkommentar gelegentlich
+                # nicht. Fehlt der Marker (leere REVIEW_COMMENT_ID), legt der Workflow ihn
+                # selbst an — existiert er, bleibt er unangetastet: kein Duplikat, kein Überschreiben.
+                if [ -z "$REVIEW_COMMENT_ID" ] || [ "$REVIEW_COMMENT_ID" = "null" ]; then
+                  gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "<!-- ai-review --> 🧭 Review-Marker vom Workflow gesetzt — Claude-Verdict \`${verdict}\`, aber kein Sammelkommentar gepostet (PR #524/#530)." 2>/dev/null || true
+                fi
+                ;;
+              *)
+                echo "::error title=❌ Review ohne Artefakt::Kein <!-- ai-review -->-Kommentar UND kein klares Verdict ('${verdict:-keins}'). Claude hat vermutlich nichts geleistet."
+                exit 1
+                ;;
+            esac
+          fi
+
+          if [ "$verdict" = "ready-to-merge" ]; then
+            allow='[]'
+            delays=(2 3 5 8)
+            for attempt in 1 2 3 4 5; do
+              checks="$(gh pr checks "$PR" --repo "$GITHUB_REPOSITORY" --json name,bucket,workflow 2>/dev/null || echo '[]')"
+              if [ -z "$checks" ]; then checks='[]'; fi
+              # `.name != "precheck"` — analog zum Gate (claude-pr-gate-merge.yml): der
+              # Label-Pre-Check laeuft unter demselben Workflow-Namen und darf das eigene
+              # Allowlist-Urteil weder rot faerben noch has_reviewer vorzeitig erfuellen.
+              # "CI" ist Consumer-abhängig → Input ci-workflow-name, via --arg ci injiziert
+              # (String-Interpolation statt Literal im jq-Programm). "5/7 Review" bleibt
+              # LITERAL: das ist der EIGENE Name — er IST der Stub-Vertrag (stubs/05-claude-
+              # pr-review.yml) und heißt in jedem Consumer exakt so.
+              allow="$(echo "$checks" | jq --arg ci "$CI_NAME" '[.[] | select(.workflow == $ci or (.workflow == "5/7 Review" and .name != "precheck"))]')"
+              has_ci="$(echo "$allow" | jq --arg ci "$CI_NAME" -r 'any(.[]; .workflow == $ci)')"
+              # Eigener Review-Name (Stub-Vertrag, immer "5/7 Review") — bewusst LITERAL:
+              has_reviewer="$(echo "$allow" | jq -r 'any(.[]; .workflow == "5/7 Review")')"
+              if [ "$has_ci" = "true" ] && [ "$has_reviewer" = "true" ]; then break; fi
+              if [ "$attempt" -lt 5 ]; then sleep "${delays[$((attempt - 1))]}"; fi
+            done
+            any_fail="false"
+            if [ "$(echo "$allow" | jq 'length')" -gt 0 ]; then
+              any_fail="$(echo "$allow" | jq -r 'any(.[]; .bucket == "fail")')"
+            fi
+            if [ "$any_fail" = "true" ]; then
+              echo "::warning::Allowlist-Check rot → Downgrade zu needs-changes"
+              verdict="needs-changes"
+            else
+              final="ready-to-merge"
+            fi
+          fi
+
+          if [ "$verdict" = "needs-human" ]; then
+            final="needs-human"
+          elif [ "$verdict" != "ready-to-merge" ]; then
+            final="needs-changes"
+          fi
+
+          gh label create "ai:needs-changes" --repo "$GITHUB_REPOSITORY" --color D93F0B 2>/dev/null || true
+          gh label create "ai:ready-to-merge" --repo "$GITHUB_REPOSITORY" --color 0E8A16 2>/dev/null || true
+          gh label create "ai:needs-review" --repo "$GITHUB_REPOSITORY" --color FBCA04 2>/dev/null || true
+          gh label create "ai:needs-human" --repo "$GITHUB_REPOSITORY" --color 5319e7 --description "Nicht-automatisierbare Entscheidung — wartet auf Mensch (Fixup greift bewusst nicht)" 2>/dev/null || true
+
+          # Label-Operationen MIT Retry (Issue #613): Exponential Backoff 1s, 2s, 4s (max. 3)
+          # Bei persistenten Fehlern → ai:needs-human + Fehlerkommentar
+          label_operation_failed="false"
+          for attempt in 1 2 3; do
+            if gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --remove-label ai:needs-review 2>/dev/null && \
+               gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --remove-label ai:needs-changes 2>/dev/null && \
+               gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --remove-label ai:ready-to-merge 2>/dev/null && \
+               gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --remove-label ai:needs-human 2>/dev/null; then
+              break
+            fi
+            if [ "$attempt" -lt 3 ]; then sleep "$((2 ** (attempt-1)))"; fi
+            if [ "$attempt" -eq 3 ]; then label_operation_failed="true"; fi
+          done
+
+          if [ "$label_operation_failed" = "true" ]; then
+            echo "::error::Label-Entfernen nach 3 Versuchen fehlgeschlagen → ai:needs-human gesetzt"
+            gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "⚠️ **Label-Race-Condition (#613)**: Label-Entfernung nach 3 Retries fehlgeschlagen (transienter GitHub-API-Fehler). Bitte manuell prüfen und via \`ai:needs-review\` neu triggern." 2>/dev/null || true
+            gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --add-label ai:needs-human 2>/dev/null || true
+            exit 1
+          fi
+
+          if [ "$final" = "ready-to-merge" ]; then
+            for attempt in 1 2 3; do
+              if gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --add-label ai:ready-to-merge; then
+                echo "::notice::Label gesetzt: ai:ready-to-merge"
+                break
+              fi
+              if [ "$attempt" -lt 3 ]; then sleep "$((2 ** (attempt-1)))"; fi
+              if [ "$attempt" -eq 3 ]; then
+                echo "::error::ai:ready-to-merge nach 3 Versuchen fehlgeschlagen → ai:needs-human gesetzt"
+                gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "⚠️ **Label-Race-Condition (#613)**: ai:ready-to-merge nach 3 Retries fehlgeschlagen. Bitte manuell prüfen." 2>/dev/null || true
+                gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --add-label ai:needs-human 2>/dev/null || true
+                exit 1
+              fi
+            done
+          elif [ "$final" = "needs-human" ]; then
+            for attempt in 1 2 3; do
+              if gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --add-label ai:needs-human; then
+                echo "::notice::Label gesetzt: ai:needs-human (wartet auf Mensch)"
+                break
+              fi
+              if [ "$attempt" -lt 3 ]; then sleep "$((2 ** (attempt-1)))"; fi
+              if [ "$attempt" -eq 3 ]; then
+                echo "::error::ai:needs-human nach 3 Versuchen fehlgeschlagen → manuelle Eingriffe erforderlich"
+                exit 1
+              fi
+            done
+            gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "⏸️ **Wartet auf menschliche Entscheidung** — nicht-automatisierbares Finding (siehe Review-Kommentar oben). Der Fixup greift hier bewusst nicht. Nach der Entscheidung: Label \`ai:needs-human\` entfernen und via \`ai:needs-review\` neu triggern." 2>/dev/null || true
+          else
+            for attempt in 1 2 3; do
+              if gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --add-label ai:needs-changes; then
+                echo "::notice::Label gesetzt: ai:needs-changes"
+                break
+              fi
+              if [ "$attempt" -lt 3 ]; then sleep "$((2 ** (attempt-1)))"; fi
+              if [ "$attempt" -eq 3 ]; then
+                echo "::error::ai:needs-changes nach 3 Versuchen fehlgeschlagen → ai:needs-human gesetzt"
+                gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "⚠️ **Label-Race-Condition (#613)**: ai:needs-changes nach 3 Retries fehlgeschlagen. Bitte manuell prüfen." 2>/dev/null || true
+                gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --add-label ai:needs-human 2>/dev/null || true
+                exit 1
+              fi
+            done
+          fi
+
+      - name: Bei Timeout PR-Kommentar (Alarm)
+        if: always() && steps.setup.outputs.configured == 'true' && steps.claude.outcome == 'cancelled'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          PR: ${{ inputs.pr-number }}
+        run: |
+          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "⚠️ **Review #${PR} – Timeout erreicht** Bitte manuell prüfen." 2>/dev/null || true
+
+      - name: Ergebnis zusammenfassen
+        if: always() && steps.setup.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          PR: ${{ inputs.pr-number }}
+          OUTCOME: ${{ steps.claude.outcome }}
+        run: |
+          labels="$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json labels --jq '[.labels[].name] | join(", ")' 2>/dev/null || true)"
+          if [ "$OUTCOME" = "success" ]; then
+            echo "::notice title=✅ Review erfolgreich::PR #${PR}"
+          elif [ "$OUTCOME" = "cancelled" ]; then
+            echo "::warning title=⏸️ Review abgebrochen"
+          else
+            echo "::error title=❌ Review fehlgeschlagen"
+          fi
+          {
+            echo "### Kreuzverhör-Review #${PR}"
+            echo "- Claude-Schritt: \`${OUTCOME:-unbekannt}\`"
+            echo "- Labels: ${labels:-keine}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 🩺 Z.AI Fair-Usage-Check (1313)
+        # Rohausgabe des Claude-Laufs auf z.ai-Fehler 1313 (Fair Usage) durchsuchen
+        # und Ergebnis als Annotation + Job-Summary sichtbar machen.
+        if: always()
+        uses: deleonio/agent-pipeline/.github/actions/llm-fair-usage-check@v1.0
+
+      - name: Review-Ergebnis prüfen (Label via API verifizieren)
+        if: always() && steps.setup.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.gh-token }}
+          PR: ${{ inputs.pr-number }}
+        run: |
+          for i in 1 2 3 4 5; do
+            labels_json="$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json labels --jq '[.labels[].name]' 2>/dev/null || echo '[]')"
+            needs_changes="$(echo "$labels_json" | jq -r 'any(.[]; . == "ai:needs-changes")')"
+            ready_to_merge="$(echo "$labels_json" | jq -r 'any(.[]; . == "ai:ready-to-merge")')"
+            needs_human="$(echo "$labels_json" | jq -r 'any(.[]; . == "ai:needs-human")')"
+            if [ "$needs_changes" = "true" ] || [ "$ready_to_merge" = "true" ] || [ "$needs_human" = "true" ]; then break; fi
+            if [ "$i" -lt 5 ]; then sleep 3; fi
+          done
+          echo "Labels verifiziert: needs_changes=${needs_changes:-?} ready_to_merge=${ready_to_merge:-?} needs_human=${needs_human:-?}"
+          if [ "$needs_changes" = "true" ]; then
+            echo "::notice title=Review: Änderungen erforderlich::PR #${PR} – ai:needs-changes gesetzt (Fixup läuft an), gültiges Ergebnis."
+          elif [ "$ready_to_merge" = "true" ]; then
+            echo "::notice title=Review: ready-to-merge::PR #${PR} – ai:ready-to-merge gesetzt."
+          elif [ "$needs_human" = "true" ]; then
+            echo "::notice title=Review: Mensch entscheidet::PR #${PR} – ai:needs-human gesetzt, wartet auf menschliche Entscheidung."
+          else
+            echo "::error title=Review stecken geblieben::PR #${PR} – weder ai:needs-changes noch ai:ready-to-merge noch ai:needs-human gesetzt."
+            exit 1
+          fi

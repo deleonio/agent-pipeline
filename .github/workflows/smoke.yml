@@ -1,0 +1,59 @@
+name: Smoke-Verifikation (Callee)
+
+# Livetest der Reusable-Workflow-Mechanik OHNE Secrets. Verifiziert die
+# Technik-Checkliste aus dem Auslagerungs-Plan:
+#   a) Remote-Auflösung von Callee + Composite Action (bewiesen, sobald der Stub läuft)
+#   b) vars-Kontext im Callee = Werte des KONSUMENTEN-Repos
+#   c) github-Kontext im Callee = Kontext des KONSUMENTEN-Runs (repository/event_name)
+#   d) Concurrency am Stub (zwei schnelle Dispatches serialisieren)
+#   f) Artefakt-Upload landet im KONSUMENTEN-Repo
+# NICHT abgedeckt (brauchen App-Secrets): e) .agent-pipeline-Checkout per App-Token,
+# g) Fork-Guard — beide im Pilot (priority-pilot) verifizieren.
+#
+# Aufruf: Stub im Konsumenten-Repo mit workflow_dispatch + concurrency-Gruppe,
+# uses: deleonio/agent-pipeline/.github/workflows/smoke.yml@v1.0, Repo-Var
+# SMOKE_VAR setzen, zweimal hintereinander dispatchen.
+
+on:
+  workflow_call:
+    inputs:
+      echo-text:
+        description: 'Beliebiger Text — landet im Artefakt (verifiziert die Durchreichung)'
+        required: false
+        default: 'smoke'
+        type: string
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Kontexte ausgeben (Checkliste b + c)
+        env:
+          SMOKE_VAR: ${{ vars.SMOKE_VAR }}
+        run: |
+          echo "github.repository (erwartet: KONSUMENT) = $GITHUB_REPOSITORY"
+          echo "github.event_name     (erwartet: Stub-Trigger, z. B. workflow_dispatch) = ${{ github.event_name }}"
+          echo "vars.SMOKE_VAR        (erwartet: Wert aus dem KONSUMENTEN-Repo) = ${SMOKE_VAR:-<leer>}"
+          echo "inputs.echo-text      = ${{ inputs.echo-text }}"
+
+      - name: Warten (Checkliste d — Concurrency-Seriialisierung am Stub sichtbar machen)
+        run: sleep 25
+
+      - name: Artefakt hochladen (Checkliste f — landet im Konsumenten-Repo)
+        run: |
+          {
+            echo "repo=$GITHUB_REPOSITORY"
+            echo "event=${{ github.event_name }}"
+            echo "smoke-var=${SMOKE_VAR:-<leer>}"
+            echo "text=${{ inputs.echo-text }}"
+          } > smoke.txt
+        # SMOKE_VAR ist im vorherigen Step nicht exportiert — hier nochmal deklarieren.
+        env:
+          SMOKE_VAR: ${{ vars.SMOKE_VAR }}
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: smoke-artifact
+          path: smoke.txt
+          retention-days: 1

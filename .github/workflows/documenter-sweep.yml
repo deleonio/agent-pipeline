@@ -1,0 +1,147 @@
+# CALLEE: 6b Documenter Sweep — Catch-up-Sweep für den PR-Documenter (Phase 7).
+# Aufgerufen vom Stub `stubs/06b-documenter-sweep.yml` (schedule/dispatch-Trigger und
+# Concurrency liegen dort). Vertrag: github.event.inputs-Bezüge via Inputs; findet gemergte
+# PRs, die NOCH KEIN ai:documented-Label tragen (verlorener Läufe — z. B. Queue-Discard vor
+# queue:max, Runner-Abbruch, deployte Workflow-Änderung), und triggert Phase 7 pro PR per
+# workflow_dispatch nach. Der fail-closed-Precheck von Phase 7 bleibt die Dedup-
+# Invariante: ist ai:documented inzwischen gesetzt, verläuft der nachgetriggerte Lauf
+# als No-op (proceed=false).
+#
+# Reiner gh-Aufruf, KEIN LLM. Muss den GitHub-App-Token nutzen: ein via GITHUB_TOKEN
+# ausgelöster workflow_dispatch startet keinen neuen Workflow-Run (GitHub-Regel), der
+# Sweep wäre sonst wirkungslos.
+
+name: Documenter Sweep (agent-pipeline callee)
+
+on:
+  workflow_call:
+    inputs:
+      dry-run:
+        description: 'Nur auflisten, nichts nachtriggern (Erst-Beobachtung eines frisch deployten Sweeps)'
+        required: false
+        type: boolean
+        default: false
+      documenter-workflow-file:
+        description: "Dateiname des Documenter-Stubs im Konsumenten-Repo, den der Sweep per workflow_dispatch triggert (load-bearing: Sweep dispatcht per Dateiname — deshalb Input)"
+        required: false
+        type: string
+        default: '07-claude-pr-documenter.yml'
+    secrets:
+      APP_ID:
+        description: 'GitHub App ID (App-Token-Mint für den workflow_dispatch)'
+        required: false
+      APP_PRIVATE_KEY:
+        description: 'GitHub App Private Key'
+        required: false
+      ZAI_API_KEY:
+        description: 'z.ai API-Key (vom Sweep ungenutzt; der Einheitlichkeit halber deklariert)'
+        required: false
+      CLAUDE_API_KEY:
+        description: 'Anthropic API-Key (vom Sweep ungenutzt; der Einheitlichkeit halber deklariert)'
+        required: false
+      OPENROUTER_API_KEY:
+        description: 'OpenRouter API-Key (vom Sweep ungenutzt; der Einheitlichkeit halber deklariert)'
+        required: false
+      TAILSCALE_AUTH_KEY:
+        description: 'Tailscale Auth-Key (vom Sweep ungenutzt; der Einheitlichkeit halber deklariert)'
+        required: false
+
+permissions:
+  contents: read # Repo-Kontext für gh-Suche
+  actions: write # workflow_dispatch auf Phase 7 (via App-Token)
+  pull-requests: read
+
+env:
+  REPO: ${{ github.repository }}
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: agent-pipeline Version
+        run: |
+          echo "::notice title=agent-pipeline::Ref v1.0"
+          echo "- agent-pipeline: v1.0" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Voraussetzung prüfen (GitHub-App-Secrets)
+        # Kein GITHUB_TOKEN-Fallback: von GITHUB_TOKEN ausgelöste workflow_dispatch-Events
+        # starten keine neuen Runs — der Sweep bräuchte dann den Menschen als Trigger und
+        # wäre für den Automatik-Zweck (schedule) tot. Bewusst rot statt still grün.
+        id: preflight
+        env:
+          APP_ID: ${{ secrets.APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$APP_ID" ] || [ -z "$APP_PRIVATE_KEY" ]; then
+            echo "::error title=App-Secrets fehlen::Sweep kann Phase 7 nicht nachtriggern (GITHUB_TOKEN-Dispatch startet keine Runs). GitHub-App-Secrets APP_ID + APP_PRIVATE_KEY setzen."
+            exit 1
+          fi
+
+      - name: GitHub-App-Token erzeugen
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Undokumentierte gemergte PRs finden und nachtriggern
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          DRY_RUN: ${{ inputs.dry-run }}
+          DOC_FILE: ${{ inputs.documenter-workflow-file }}
+        run: |
+          set -euo pipefail
+
+          # Nur gemergte, undokumentierte, nicht ignorierte PRs der letzten 30 Tage.
+          # Such-Qualifier statt Client-Filter: -label: schließt Label-Treffer serverseitig
+          # aus; die closedAt-Sperre hält den Sweep von Altlasten fern (closedAt == mergedAt
+          # bei gemergten PRs).
+          cutoff="$(date -u -d '30 days ago' +%Y-%m-%dT%H:%M:%SZ)"
+          candidates="$(gh pr list --repo "$REPO" --state merged --limit 50 \
+            --search '-label:ai:documented -label:release:ignore' \
+            --json number,title,closedAt,labels \
+            | jq --arg cutoff "$cutoff" '
+                [.[] | select(.closedAt != null and .closedAt > $cutoff)]
+                | sort_by(.closedAt)   # älteste zuerst: FIFO heilt den Rückstand in Ordnung
+                | .[0:10]              # Batchgrenze: Kontext-/Rate-Limits, Rest kommt im nächsten Lauf
+              ')"
+
+          count="$(printf '%s' "$candidates" | jq 'length')"
+          echo "Kandidaten (gemergt, ohne ai:documented/release:ignore, letzte 30 Tage): $count"
+
+          {
+            echo "### 6b Documenter Sweep"
+            echo
+            if [ "$count" -eq 0 ]; then
+              echo "Keine undokumentierten gemergten PRs — nichts nachzutriggern. ✅"
+            else
+              echo "| PR | Titel | Gemergt | Aktion |"
+              echo "|----|-------|---------|--------|"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$count" -eq 0 ]; then exit 0; fi
+
+          printf '%s' "$candidates" | jq -c '.[]' | while IFS= read -r pr; do
+            number="$(printf '%s' "$pr" | jq -r '.number')"
+            title="$(printf '%s' "$pr" | jq -r '.title' | tr -d '|')"
+            closed="$(printf '%s' "$pr" | jq -r '.closedAt')"
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "| #$number | $title | $closed | ⏸️ dry-run |" >> "$GITHUB_STEP_SUMMARY"
+              echo "[dry-run] würde Phase 7 für PR #$number nachtriggern."
+              continue
+            fi
+            # Dateiname = Stub-Vertrag (load-bearing, s. Stub-Kopf), deshalb Input statt
+            # hartem Literal: der Default entspricht dem gepinnten Stub-Namen.
+            if gh workflow run "$DOC_FILE" --repo "$REPO" -f "pr-number=$number"; then
+              echo "| #$number | $title | $closed | 🚀 nachgetriggert |" >> "$GITHUB_STEP_SUMMARY"
+              echo "🚀 Phase 7 für PR #$number nachgetriggert."
+            else
+              echo "| #$number | $title | $closed | ❌ Dispatch fehlgeschlagen |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning title=Dispatch fehlgeschlagen::Phase 7 für PR #$number konnte nicht nachgetriggert werden."
+            fi
+            sleep 5 # Phase-6-Queue (queue: max, FIFO) atmet zwischen den Dispatches
+          done
+
+          echo "Sweep abgeschlossen — Details in der Job-Summary."

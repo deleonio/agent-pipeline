@@ -1,0 +1,665 @@
+name: 'Setup Claude Code Agent'
+description: 'Preflight, App-Token, Claude-Code-Install + Auth (Provider-Switch zai/claude), Ticket-Auflösung, Invoke-Resolution, Memory-Load/Save – einheitlich für alle 5 Pipeline-Workflows'
+
+inputs:
+  needs-mcp:
+    description: 'Ob KoliBri MCP für diesen Workflow benötigt wird (triage + implement = true). Steuert nur die allowedTools; registriert ist der Server in .claude/settings.json.'
+    required: false
+    default: 'false'
+  tools-tier:
+    description: 'Permission-Tier für diesen Lauf. "restricted" = nur lesender GitHub-Zugriff via gh/git, kein Bypass (Triage). "review" = Vollzugriff minus Write/Edit. "full" = vollautonom mit Bypass (Default; Spec/Implement/Fixup). Steuert --allowedTools / --dangerously-skip-permissions / --disallowedTools. Der globale deny-Layer in .claude/settings.json greift in JEDEM Tier (auch unter bypass).'
+    required: false
+    default: 'full'
+  event-type:
+    description: 'github.event_name (issues oder pull_request)'
+    required: true
+  ticket-ref:
+    description: 'Issue- oder PR-Nummer (für Ticket-Auflösung)'
+    required: true
+  app-id:
+    description: 'GitHub App ID (secret)'
+    required: true
+  app-private-key:
+    description: 'GitHub App Private Key (secret)'
+    required: true
+  llm-provider:
+    description: 'LLM-Provider für diesen Lauf: "claude" (Anthropic nativ, Default), "zai" (z.ai/GLM) oder "openrouter" (OpenRouter). Aus vars.LLM_PROVIDER; leer = claude.'
+    required: false
+    default: 'claude'
+  zai-api-key:
+    description: 'API-Key für z.ai (secret, secrets.ZAI_API_KEY). Nur bei llm-provider=zai erforderlich.'
+    required: false
+  claude-api-key:
+    description: 'API-Key für Anthropic (secret, secrets.CLAUDE_API_KEY). Nur bei llm-provider=claude erforderlich.'
+    required: false
+  openrouter-api-key:
+    description: 'API-Key für OpenRouter (secret, secrets.OPENROUTER_API_KEY). Nur bei llm-provider=openrouter erforderlich.'
+    required: false
+  # Settings-JSON direkt als Input (aus GitHub Variables) – vermeidet gh CLI Auth-Probleme
+  zai-settings-json:
+    description: 'settings.local.json für zai als JSON-String (aus vars.CLAUDE_CODE_SETTINGS_LOCAL_ZAI)'
+    required: false
+    default: ''
+  openrouter-settings-json:
+    description: 'settings.local.json für openrouter als JSON-String (aus vars.CLAUDE_CODE_SETTINGS_LOCAL_OPENROUTER)'
+    required: false
+    default: ''
+  # Memory-Funktionen für pro-Issue Persistenz (dateibasiert via Workflow-ARTEFAKTE).
+  #
+  # WARUM ARTEFAKTE STATT CACHE (2026-08-16): Der Actions-Cache ist für diese Pipeline
+  # schreib-tot. GitHubs Richtlinie vom 2026-06-26 ("Read-only Actions cache for untrusted
+  # triggers") vergibt für Issue-/Label-/PR-getriggerte Läufe UND für die daraus kaskadierten
+  # workflow_run-Läufe nur lese-only Cache-Token. Der frühere Umweg über den workflow_run-
+  # Begleitworkflow scheiterte deshalb in JEDEM Lauf mit "cache write denied: token has no
+  # writable scopes" — als ##[warning], also bei grünem Job (belegt in den Persist-Runs
+  # 31891908903, 31893430552, 31903885353, 31904169169; im Repo existierte zu keinem
+  # Zeitpunkt ein claude-memory-*-Cache). Der Scope hängt am Trust-Level des Triggers, NICHT
+  # an den Permissions — `actions: write` ändert daran nichts.
+  # Artefakte unterliegen dieser Restriktion nicht und sind damit der Speicher: jede Phase
+  # lädt .claude/memory als Artefakt `claude-memory-issue-{N}` hoch, die Folgephase holt sich
+  # das JÜNGSTE nicht-abgelaufene Artefakt dieses Namens zurück (repo-weite Artefakt-Suche).
+  #
+  # Memory-Save passiert NICHT hier (die Action läuft nur pre-claude), sondern als
+  # upload-artifact-Step im Workflow nach dem claude-Step. Die Action liefert dafür
+  # memory-save-key (stabil pro Issue = Artefakt-Name) + memory-path (flach .claude/memory).
+  # Claude liest/schreibt seinen Memory NATIV nach .claude/memory (autoMemoryDirectory in
+  # .claude/settings.json) — Isolierung pro Issue erfolgt NICHT über einen Subdir, sondern
+  # rein über den Artefakt-Namen: jeder Lauf restored/saved den zum Issue passenden Stand in
+  # denselben flachen Pfad.
+  memory-load:
+    description: 'Memory-Load zu Beginn des Workflows (true = restauriert dateibasierte Memory für ticket-ref aus dem jüngsten Issue-Artefakt). Alle 6 Phasen-Workflows laden (auch Triage: Erst-Triage startet leer, Re-Triage nutzt den bisherigen Stand); false nur für bewusst stateless Helper-Workflows.'
+    required: false
+    default: 'false'
+  expect-memory:
+    description: 'Erwartet die Phase vorherige Phasen-Notizen (Restore)? true ab Phase 2. Bei leerem Restore → Warning (Resume-Kontext fehlt); false (Phase 1) → leeres Memory ist normal, keine Warning.'
+    required: false
+    default: 'false'
+  model:
+    description: 'Claude-Modell für diesen Lauf als Alias (fable|opus|sonnet|haiku); leer = kein --model (Default aus .claude/settings.json). Der Alias wird providerspezifisch aufgelöst (claude nativ via --model, zai/openrouter via settings.local.json); ein ungültiger Alias bricht laut ab (kein stiller Fallback).'
+    required: false
+    default: ''
+  # Tailscale-Exit-Node: optional. Verbindet den Runner VOR dem claude-Step mit dem Exit Node,
+  # sodass der gesamte LLM-Traffic über eine konsistente IP egressiert (verhindert z.ai/
+  # OpenRouter "Account geteilt"-Flagging durch wechselnde Azure-Runner-IPs). Kill-Switch:
+  # leerer tailscale-exit-node (vars.TAILSCALE_EXIT_NODE nicht gesetzt) deaktiviert das Routing
+  # komplett → exakt heutiges Verhalten. Fail-closed: bei gesetztem Exit-Node + fehlendem/schlech-
+  # tem Key scheitert der Connect laut → claude-Step wird übersprungen (kein direkter Azure-Egress).
+  tailscale-authkey:
+    description: 'Tailscale Auth-Key (secret, secrets.TAILSCALE_AUTH_KEY; reusable + ephemeral + tag:ci). Zusammen mit tailscale-exit-node aktiv; sonst ignoriert.'
+    required: false
+    default: ''
+  tailscale-exit-node:
+    description: 'Tailscale-Exit-Node (Name oder 100.x.y.z, aus vars.TAILSCALE_EXIT_NODE). LEER = Routing deaktiviert (Kill-Switch). Vorhanden = aktiv, Connect fail-closed.'
+    required: false
+    default: ''
+  # MCP-Tool-Glob für needs-mcp=true. Früher auf mcp__kolibri-mcp__* festverdrahtet —
+  # als Input nutzbar für Konsumenten-Repos ohne KoliBri (leer = keine MCP-Tools).
+  mcp-tools:
+    description: 'MCP-Tool-Glob, der bei needs-mcp=true an --allowedTools angehängt wird (z. B. "mcp__kolibri-mcp__*"). LEER = keine MCP-Tools (Repos ohne MCP-Server).'
+    required: false
+    default: 'mcp__kolibri-mcp__*'
+  # Pipeline-Repo-Checkout: stellt Skripte + Prompts für die Callee-Workflows bereit
+  # (.agent-pipeline/.github/{scripts,prompts}). Der Checkout läuft mit dem oben
+  # geminteten App-Token — Voraussetzung: die GitHub App ist auch auf dem Pipeline-Repo
+  # installiert (lesend genügt). Fail-closed: schlägt er fehl, endet setup-claude rot,
+  # statt Phase-Steps mit fehlenden Dateien laufen zu lassen.
+  pipeline-checkout:
+    description: 'true = Pipeline-Repo nach .agent-pipeline/ auschecken (Skripte/Prompts für Callee-Steps). Fail-closed bei Fehler.'
+    required: false
+    default: 'true'
+  pipeline-repo:
+    description: 'Repo (owner/name), das nach .agent-pipeline/ ausgecheckt wird.'
+    required: false
+    default: 'deleonio/agent-pipeline'
+  pipeline-ref:
+    description: 'Ref (Minor-Tag, z. B. v1.0) für den Pipeline-Checkout. Muss zum gepinnten Stub-Tag passen — wird im Release-Checklist-Schritt aktualisiert.'
+    required: false
+    default: 'v1.0'
+
+outputs:
+  configured:
+    description: 'Ob App-Secrets konfiguriert sind'
+    value: ${{ steps.preflight.outputs.configured }}
+  gh-token:
+    description: 'GitHub Token für gh-Befehle (App-Token oder GITHUB_TOKEN)'
+    value: ${{ steps.gh-token.outputs.token }}
+  issue-number:
+    description: 'Aufgelöste Issue-Nummer (für Issue-Events direkt, für PR-Events via closingIssuesReferences)'
+    value: ${{ steps.ticket.outputs.issue-number }}
+  invoke-cmd:
+    description: 'Invoke-Befehl (claude -p)'
+    value: ${{ steps.resolve-invoke.outputs.invoke-cmd }}
+  invoke-args:
+    description: 'Invoke-Argumente (Claude-Flags inkl. --allowedTools)'
+    value: ${{ steps.resolve-invoke.outputs.invoke-args }}
+  llm-provider:
+    description: 'Der tatsächlich aufgelöste Provider ("zai" oder "claude")'
+    value: ${{ steps.provider.outputs.llm-provider }}
+  memory-loaded:
+    description: 'Ob pro-Issue Memory aus einer Vor-Phase geladen wurde (Artefakt gefunden UND heruntergeladen)'
+    value: ${{ steps.memory-load.outputs.found }}
+  memory-path:
+    description: 'Flacher Claude-Memory-Pfad (.claude/memory); Claude pflegt ihn nativ via autoMemoryDirectory. Pro-Issue-Isolierung erfolgt über den Artefakt-Namen, nicht über einen Subdir.'
+    value: .claude/memory
+  memory-save-key:
+    description: 'Stabiler Artefakt-Name pro Issue. Jede Phase lädt ihren Stand unter diesem Namen hoch; die Folgephase holt das jüngste nicht-abgelaufene Artefakt dieses Namens.'
+    value: claude-memory-issue-${{ steps.ticket.outputs.issue-number }}
+  memory-restored:
+    description: 'Ob tatsächlich Memory-Dateien restauriert wurden (Artefakt geladen UND Dateianzahl > 0).'
+    value: ${{ steps.memory-verify.outputs.restored }}
+  memory-file-count:
+    description: 'Anzahl restaurierter Memory-Dateien in .claude/memory/.'
+    value: ${{ steps.memory-verify.outputs.file-count }}
+  memory-status-text:
+    description: 'Sed-sicherer Restore-Status für den Prompt-Platzhalter #MEMORY_STATUS ("vorhanden" | "leer").'
+    value: ${{ steps.memory-verify.outputs.status-text }}
+  pipeline-sha:
+    description: 'Commit-SHA des .agent-pipeline-Checkouts (leer, wenn pipeline-checkout=false). Für das Versions-Echo in Callee-Läufen (Debugging: welcher Pipeline-Stand lief?).'
+    value: ${{ steps.pipeline-check.outputs.pipeline-sha }}
+
+runs:
+  using: composite
+  steps:
+    - name: Voraussetzung prüfen (GitHub-App-Secrets)
+      id: preflight
+      env:
+        APP_ID: ${{ inputs.app-id }}
+        APP_PRIVATE_KEY: ${{ inputs.app-private-key }}
+      shell: bash
+      run: |
+        if [ -z "$APP_ID" ] || [ -z "$APP_PRIVATE_KEY" ]; then
+          echo "::warning::GitHub-App-Secrets fehlen – Lauf wird übersprungen."
+          echo "configured=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: GitHub-App-token erzeugen
+      id: app-token
+      if: steps.preflight.outputs.configured == 'true'
+      uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+      with:
+        client-id: ${{ inputs.app-id }}
+        private-key: ${{ inputs.app-private-key }}
+
+    - name: App-Token durchreichen (App-only — kein GITHUB_TOKEN-Fallback)
+      id: gh-token
+      shell: bash
+      run: |
+        APP_TOK="${{ steps.app-token.outputs.token }}"
+        if [ -n "$APP_TOK" ] && [ "$APP_TOK" != "null" ]; then
+          echo "token=$APP_TOK" >> "$GITHUB_OUTPUT"
+          echo "::notice::Nutze GitHub-App-Token für gh-Befehle."
+        else
+          # App-only-Pipeline: ohne App-Token kann weder gepusht (Contents:Write) noch ein
+          # Folge-Workflow getriggert werden (GITHUB_TOKEN-Events lösen keine Runs aus). Ein
+          # stiller GITHUB_TOKEN-Fallback endet grün, pusht nicht und loopt — deshalb LAUT
+          # abbrechen statt degradieren.
+          echo "::error::App-Token nicht verfügbar – Pipeline ist App-only. Abbruch statt GITHUB_TOKEN-Fallback (Push braucht Contents:Write, Label-Wechsel müssen Folge-Workflows triggern). Secrets APP_ID/APP_PRIVATE_KEY oder die App-Installation prüfen."
+          exit 1
+        fi
+
+    - name: Git-Remote origin auf App-Token umstellen (wie deploy.yml)
+      if: steps.preflight.outputs.configured == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.gh-token.outputs.token }}
+      run: |
+        # App-Token DIREKT in die origin-URL einbetten — exakt wie deploy.yml. Der frühere
+        # insteadOf-Rewrite wurde vom per `persist-credentials` (Default true) von checkout
+        # hinterlegten GITHUB_TOKEN überstimmt, sodass der Agent als github-actions[bot]
+        # (contents:read) statt als App (Contents:Write) pushte → 403. Mit persist-credentials:false
+        # an allen Claude-Checkouts gibt es keine konkurrierende Credential mehr; origin trägt
+        # als einzige das App-Token.
+        git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+        echo "::notice::origin-Remote auf App-Token umgestellt (Contents:Write für Push)."
+
+    - name: Ticket-ID auflösen (Issue-Nummer)
+      id: ticket
+      if: steps.preflight.outputs.configured == 'true'
+      env:
+        GH_TOKEN: ${{ steps.gh-token.outputs.token }}
+        EVENT_TYPE: ${{ inputs.event-type }}
+        TICKET_REF: ${{ inputs.ticket-ref }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+      shell: bash
+      run: |
+        if [ "$EVENT_TYPE" = "pull_request" ]; then
+          ISSUE_NR=$(gh pr view "$TICKET_REF" --repo "$GITHUB_REPOSITORY" \
+            --json closingIssuesReferences \
+            --jq '[.closingIssuesReferences[].number] | first' 2>/dev/null || echo "")
+          if [ -z "$ISSUE_NR" ] || [ "$ISSUE_NR" = "null" ]; then
+            ISSUE_NR="$TICKET_REF"
+            echo "::notice::Kein Closing-Issue am PR #$TICKET_REF gefunden – nutze PR-Nummer als Fallback."
+          else
+            echo "::notice::PR #$TICKET_REF → Issue #$ISSUE_NR."
+          fi
+        else
+          ISSUE_NR="$TICKET_REF"
+        fi
+        echo "issue-number=$ISSUE_NR" >> "$GITHUB_OUTPUT"
+
+    - name: Memory-Load (pro Issue, jüngstes Artefakt)
+      # Kein actions/cache/restore mehr: der Cache-SAVE ist für diese Pipeline platform-seitig
+      # gesperrt (s. Kopf-Kommentar), ein Restore hätte also nie einen Treffer. Der Speicher sind
+      # Artefakte — hier wird das jüngste nicht-abgelaufene Artefakt `claude-memory-issue-{N}`
+      # repo-weit gesucht und in den flachen Pfad .claude/memory entpackt.
+      #
+      # Token: bevorzugt das App-Token (überall sonst in dieser Action verwendet); schlägt die
+      # Artefakt-API damit fehl (App ohne Actions-Read), greift GITHUB_TOKEN als zweiter Versuch.
+      # Beide erfolglos → found=false, was der Verify-Step unten LAUT meldet (statt still leer).
+      id: memory-load
+      if: steps.preflight.outputs.configured == 'true' && inputs.memory-load == 'true'
+      shell: bash
+      env:
+        APP_TOKEN: ${{ steps.gh-token.outputs.token }}
+        FALLBACK_TOKEN: ${{ github.token }}
+        MEMORY_NAME: claude-memory-issue-${{ steps.ticket.outputs.issue-number }}
+      run: |
+        set -uo pipefail
+        mkdir -p .claude/memory
+        found="false"
+        for tok in "$APP_TOKEN" "$FALLBACK_TOKEN"; do
+          if [ -z "$tok" ] || [ "$tok" = "null" ]; then continue; fi
+          # ?name= filtert serverseitig auf EXAKTEN Namen (claude-memory-issue-68 matcht also
+          # nicht claude-memory-issue-687); abgelaufene Artefakte sind nicht mehr ladbar.
+          run_id="$(GH_TOKEN="$tok" gh api \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$MEMORY_NAME&per_page=100" \
+            --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | reverse | .[0].workflow_run.id // empty' 2>/dev/null || true)"
+          if [ -z "$run_id" ]; then continue; fi
+          if GH_TOKEN="$tok" gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
+               --name "$MEMORY_NAME" --dir .claude/memory 2>/dev/null; then
+            found="true"
+            echo "::notice title=🧠 Memory-Artefakt geladen::$MEMORY_NAME aus Run $run_id."
+            break
+          fi
+          echo "::warning title=Memory-Download fehlgeschlagen::Artefakt $MEMORY_NAME (Run $run_id) gefunden, Download scheiterte."
+        done
+        echo "found=$found" >> "$GITHUB_OUTPUT"
+
+    - name: Memory-Verzeichnis sicherstellen (Claude-Schreibzugriff auch bei Miss / memory-load=false)
+      # Entkoppelt von memory-load: auch bei Restore-Miss (Erst-Triage) oder memory-load=false
+      # (stateless Helper) MUSS geschrieben werden dürfen → Verzeichnis immer anlegen.
+      if: steps.preflight.outputs.configured == 'true'
+      shell: bash
+      run: mkdir -p ".claude/memory"
+
+    - name: Memory-Restore verifizieren (ab Phase 2)
+      # Prüft, OB wirklich Memory restauriert wurde (Artefakt geladen + Dateianzahl > 0). Phase 1
+      # (memory-load=false) überspringt diesen Schritt — leeres Memory ist dort der Normalfall.
+      # Ab Phase 2 (expect-memory=true) warnt ein leerer Restore: entweder hat die Vor-Phase
+      # nichts geschrieben, ODER der Artefakt-Upload/-Download schlug fehl.
+      id: memory-verify
+      if: steps.preflight.outputs.configured == 'true' && inputs.memory-load == 'true'
+      shell: bash
+      env:
+        EXPECT_MEMORY: ${{ inputs.expect-memory }}
+        ISSUE_NR: ${{ steps.ticket.outputs.issue-number }}
+        ARTIFACT_FOUND: ${{ steps.memory-load.outputs.found }}
+      run: |
+        count=$(find .claude/memory -type f 2>/dev/null | wc -l | tr -d ' ')
+        restored="false"
+        if [ "${ARTIFACT_FOUND}" = "true" ] && [ "${count:-0}" -gt 0 ]; then restored="true"; fi
+        echo "file-count=${count:-0}" >> "$GITHUB_OUTPUT"
+        echo "restored=$restored" >> "$GITHUB_OUTPUT"
+        if [ "$restored" = "true" ]; then
+          echo "status-text=vorhanden" >> "$GITHUB_OUTPUT"
+          echo "::notice title=🧠 Memory-Restore OK::Issue #${ISSUE_NR} — ${count} Memory-Datei(en) geladen."
+        else
+          echo "status-text=leer" >> "$GITHUB_OUTPUT"
+          if [ "${EXPECT_MEMORY}" = "true" ]; then
+            echo "::warning title=⚠️ Memory-Restore leer::Issue #${ISSUE_NR} — keine Phasen-Notizen geladen (vorherige Phase schrieb nichts ODER Persistierung fehlgeschlagen). Resume-Kontext fehlt."
+          else
+            echo "::notice title=🧠 Memory leer (erwartet)::Issue #${ISSUE_NR} — erste Phase, kein Vor-Kontext."
+          fi
+        fi
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # CLAUDE CODE – Install + Provider-Switch + Auth + (optional) KoliBri MCP
+    #
+    # Provider + Modell-Aliase kommen NICHT aus .claude/settings.json: die Datei ist
+    # eingecheckt und wird von lokalen Entwickler-Sessions mitbenutzt – ein dort
+    # gesetztes ANTHROPIC_BASE_URL würde jede lokale Session zwangs-umrouten.
+    # Deshalb setzt diese Action Endpoint, Modell-Aliase und Key pro Lauf via
+    # GITHUB_ENV, gesteuert über vars.LLM_PROVIDER.
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    - name: Claude Code installieren
+      if: steps.preflight.outputs.configured == 'true'
+      shell: bash
+      run: |
+        npm install -g @anthropic-ai/claude-code
+        echo "::notice::Claude Code CLI installiert."
+
+    - name: Claude Code Trust-Dialog für CI-Workspace akzeptieren
+      if: steps.preflight.outputs.configured == 'true'
+      shell: bash
+      run: |
+        mkdir -p "$HOME/.claude"
+        CLAUDE_JSON="$HOME/.claude.json"
+        WORKSPACE_PATH="${{ github.workspace }}"
+        if [ -f "$CLAUDE_JSON" ]; then
+          tmp=$(mktemp)
+          jq --arg wp "$WORKSPACE_PATH" '.projects[$wp].hasTrustDialogAccepted = true' "$CLAUDE_JSON" > "$tmp" && mv "$tmp" "$CLAUDE_JSON"
+        else
+          jq -n --arg wp "$WORKSPACE_PATH" '{projects: {($wp): {hasTrustDialogAccepted: true}}}' > "$CLAUDE_JSON"
+        fi
+        echo "::notice::Claude Code Trust-Dialog für CI-Workspace ($WORKSPACE_PATH) akzeptiert."
+
+    - name: Provider auflösen + Auth setzen
+      id: provider
+      if: steps.preflight.outputs.configured == 'true'
+      shell: bash
+      env:
+        LLM_PROVIDER: ${{ inputs.llm-provider }}
+        ZAI_API_KEY: ${{ inputs.zai-api-key }}
+        CLAUDE_API_KEY: ${{ inputs.claude-api-key }}
+        OPENROUTER_API_KEY: ${{ inputs.openrouter-api-key }}
+        ZAI_SETTINGS_JSON: ${{ inputs.zai-settings-json }}
+        OPENROUTER_SETTINGS_JSON: ${{ inputs.openrouter-settings-json }}
+        CLAUDE_MODEL: ${{ inputs.model }}
+      run: |
+        PROVIDER="${LLM_PROVIDER:-claude}"
+
+        # Secrets strippen (Whitespace/Newlines)
+        CLAUDE_API_KEY="$(printf '%s' "$CLAUDE_API_KEY" | tr -d '[:space:]')"
+        ZAI_API_KEY="$(printf '%s' "$ZAI_API_KEY" | tr -d '[:space:]')"
+        OPENROUTER_API_KEY="$(printf '%s' "$OPENROUTER_API_KEY" | tr -d '[:space:]')"
+
+        case "$PROVIDER" in
+          claude)
+            if [ -z "$CLAUDE_API_KEY" ]; then
+              echo "::error title=Auth fehlt::vars.LLM_PROVIDER=claude, aber Secret CLAUDE_API_KEY ist leer."
+              exit 1
+            fi
+            # Anthropic kennt ZWEI Token-Typen:
+            #   sk-ant-api…  klassischer API-Key   → ANTHROPIC_API_KEY
+            #   sk-ant-oat…  OAuth-Token aus `claude setup-token` → CLAUDE_CODE_OAUTH_TOKEN
+            case "$CLAUDE_API_KEY" in
+              sk-ant-oat*)
+                echo "CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_API_KEY" >> "$GITHUB_ENV"
+                echo "::notice::Provider=claude – OAuth-Token erkannt (sk-ant-oat…) → CLAUDE_CODE_OAUTH_TOKEN."
+                ;;
+              sk-ant-*)
+                echo "ANTHROPIC_API_KEY=$CLAUDE_API_KEY" >> "$GITHUB_ENV"
+                echo "::notice::Provider=claude – API-Key erkannt (sk-ant-…) → ANTHROPIC_API_KEY."
+                ;;
+              *)
+                echo "ANTHROPIC_API_KEY=$CLAUDE_API_KEY" >> "$GITHUB_ENV"
+                echo "::warning title=Unerwartetes Token-Format::CLAUDE_API_KEY beginnt nicht mit 'sk-ant-'. Versuche als ANTHROPIC_API_KEY."
+                ;;
+            esac
+            ;;
+          zai)
+            if [ -z "$ZAI_API_KEY" ]; then
+              echo "::error title=Auth fehlt::vars.LLM_PROVIDER=zai, aber Secret ZAI_API_KEY ist leer."
+              exit 1
+            fi
+            # settings.local.json aus Input bauen
+            if [ -n "$ZAI_SETTINGS_JSON" ]; then
+              echo "$ZAI_SETTINGS_JSON" > .claude/settings.local.json
+              echo "::notice::settings.local.json aus Input zai-settings-json geschrieben."
+            else
+              echo "::warning::Input zai-settings-json leer – keine settings.local.json für zai."
+            fi
+            # Auth Token setzen (z.ai nutzt ANTHROPIC_AUTH_TOKEN als Bearer)
+            echo "ANTHROPIC_AUTH_TOKEN=$ZAI_API_KEY" >> "$GITHUB_ENV"
+            ;;
+          openrouter)
+            if [ -z "$OPENROUTER_API_KEY" ]; then
+              echo "::error title=Auth fehlt::vars.LLM_PROVIDER=openrouter, aber Secret OPENROUTER_API_KEY ist leer."
+              exit 1
+            fi
+            # settings.local.json aus Input bauen
+            if [ -n "$OPENROUTER_SETTINGS_JSON" ]; then
+              echo "$OPENROUTER_SETTINGS_JSON" > .claude/settings.local.json
+              echo "::notice::settings.local.json aus Input openrouter-settings-json geschrieben."
+            else
+              echo "::warning::Input openrouter-settings-json leer – keine settings.local.json für openrouter."
+            fi
+            # Auth Token setzen (OpenRouter nutzt ANTHROPIC_AUTH_TOKEN als Bearer)
+            echo "ANTHROPIC_AUTH_TOKEN=$OPENROUTER_API_KEY" >> "$GITHUB_ENV"
+            ;;
+          *)
+            echo "::error title=Unbekannter Provider::vars.LLM_PROVIDER='$PROVIDER' – erlaubt sind 'claude', 'zai' oder 'openrouter'."
+            exit 1
+            ;;
+        esac
+
+        echo "llm-provider=$PROVIDER" >> "$GITHUB_OUTPUT"
+
+        # Phasen-Modell (#511): Alias fable|opus|sonnet|haiku providerspezifisch aufloesen.
+        # claude (nativ) erhaelt die konkrete Modell-ID via --model (resolve-invoke); zai/
+        # openrouter loesen den Alias im settings.local.json-Kontext auf (Modell-Feld setzen).
+        case "$CLAUDE_MODEL" in
+          fable)  RESOLVED_MODEL_ID="claude-fable-5" ;;
+          opus)   RESOLVED_MODEL_ID="claude-opus-5" ;;
+          sonnet) RESOLVED_MODEL_ID="claude-sonnet-5" ;;
+          haiku)  RESOLVED_MODEL_ID="claude-haiku-4-5-20251001" ;;
+          "")
+            RESOLVED_MODEL_ID=""
+            ;;
+          *)
+            echo "::error title=Ungueltiger Modell-Alias::inputs.model='$CLAUDE_MODEL' — erlaubt: fable | opus | sonnet | haiku (oder leer fuer settings.json-Default). Kein stiller Fallback auf einen falsches Modell."
+            exit 1
+            ;;
+        esac
+
+        if [ -n "$RESOLVED_MODEL_ID" ]; then
+          case "$PROVIDER" in
+            zai|openrouter)
+              if [ -f .claude/settings.local.json ]; then
+                tmp_model=$(mktemp)
+                jq --arg m "$RESOLVED_MODEL_ID" '.model = $m' .claude/settings.local.json > "$tmp_model" && mv "$tmp_model" .claude/settings.local.json
+                echo "::notice title=Modell::$RESOLVED_MODEL_ID (Alias '$CLAUDE_MODEL', Provider $PROVIDER) via settings.local.json aufgeloest."
+              else
+                echo "::warning title=Modell::Phasen-Modell '$CLAUDE_MODEL' ($RESOLVED_MODEL_ID) konnte nicht in settings.local.json geschrieben werden — Datei fehlt (Provider $PROVIDER ohne settings-json). Modell bleibt unaufgeloest."
+              fi
+              echo "resolved-model=" >> "$GITHUB_OUTPUT"
+              ;;
+            claude)
+              echo "::notice title=Modell::$RESOLVED_MODEL_ID (Alias '$CLAUDE_MODEL') via --model."
+              echo "resolved-model=$RESOLVED_MODEL_ID" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+        else
+          echo "::notice title=Modell::Kein Phasen-Modell gesetzt — Default aus .claude/settings.json."
+          echo "resolved-model=" >> "$GITHUB_OUTPUT"
+        fi
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # INVOKE-RESOLUTION – setzt invoke-cmd + invoke-args
+    # --model nur bei gesetztem Phasen-Modell (steps.provider.outputs.resolved-model);
+    # leerer Wert belässt das Modell in .claude/settings.json (aktueller Zustand).
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    - name: Invoke auflösen
+      id: resolve-invoke
+      if: steps.preflight.outputs.configured == 'true'
+      shell: bash
+      env:
+        NEEDS_MCP: ${{ inputs.needs-mcp }}
+        MCP_TOOLS: ${{ inputs.mcp-tools }}
+        TOOLS_TIER: ${{ inputs.tools-tier }}
+        CLAUDE_MODEL: ${{ inputs.model }}
+        RESOLVED_MODEL: ${{ steps.provider.outputs.resolved-model }}
+      run: |
+        echo "invoke-cmd=claude -p" >> "$GITHUB_OUTPUT"
+
+        # Phasen-Modell (nur bei gesetztem Alias) als --model an claude weiterreichen.
+        # Leerer Wert (kein Phasen-Modell oder Nicht-claude-Provider) -> kein --model,
+        # das Modell kommt aus .claude/settings.json (bisheriges Verhalten).
+        MODEL_FLAG=""
+        if [ -n "$RESOLVED_MODEL" ]; then
+          MODEL_FLAG="--model $RESOLVED_MODEL"
+        fi
+
+        # MCP-Tool-Glob aus dem Input (Default kolibri-mcp, spiegelt .mcp.json der
+        # Konsumenten); aktiv nur bei needs-mcp UND nicht-leerem Glob — leer würde
+        # sonst einen hängenden Komma-Anhang in --allowedTools produzieren.
+        VOLLES_TOOLSET="Read,Glob,Grep,Bash,Write,Edit"
+
+        case "${TOOLS_TIER:-full}" in
+          restricted)
+            # Tier 1 — nur lesender GitHub-Zugriff, KEIN Bypass (Triage arbeitet nur via gh).
+            # Bash(gh *)/Bash(git *) bleiben eng, Write/Edit bewusst nicht erlaubt — einzige
+            # Ausnahme: Edit auf den nativen Memory (autoMemoryDirectory = .claude/memory), damit
+            # Claude seine Phasen-Notizen schreiben kann. Zwei Globs defensiv: /* deckt Wurzeldateien
+            # (MEMORY.md + Notizen — das flache auto-memory Layout), /** verschachtelte Pfade falls
+            # auto-memory Subdirs anlegt (allein ** matcht Wurzeldateien nicht zuverlässig).
+            # Claude Code wertet für Datei-Schreibzugriffe NUR Edit(path)-Regeln aus — Write(path)
+            # wird ignoriert (Edit deckt alle file-editing-Tools inkl. Write ab).
+            ALLOWED_TOOLS="Read,Glob,Grep,Bash(gh *),Bash(git *),Edit(.claude/memory/*),Edit(.claude/memory/**)"
+            [ "$NEEDS_MCP" = "true" ] && [ -n "$MCP_TOOLS" ] && ALLOWED_TOOLS="$ALLOWED_TOOLS,$MCP_TOOLS"
+            # — !WICHTIG! —
+            # Zwingendes Single-Quoting des Wertes nach --allowedTools (und --disallowedTools):
+            # die Tool-Spezifizierer enthalten '(' und '*' (z.B. 'Bash(gh *)'). GitHub Actions
+            # substituiert ${{ steps.setup.outputs.invoke-args }} WÖRTLICH in den run:-Block,
+            # OHNE Quoting-Layer. Ungequotet parst bash '(' als Subshell-Start → Syntaxfehler
+            # (exit 2, "syntax error near unexpected token `('"). Das betrifft das restricted-
+            # und review-Tier (Edit(path)-Globs), full nutzt weiter das klammerfreie
+            # VOLLES_TOOLSET — wir quoten konsistent in allen drei Zweigen, damit ein späteres
+            # Tool mit '(' in full nicht denselben Crash auslöst.
+            echo "invoke-args=--allowedTools '$ALLOWED_TOOLS' $MODEL_FLAG" >> "$GITHUB_OUTPUT"
+            ;;
+          review)
+            # Vollzugriff auf Lesen/Ausführen, schreibgeschützt für Code — Review liest
+            # untrusted Diffs und ändert keinen Code. EINZIGE Schreiböffnung: der Issue-Memory
+            # (.claude/memory) über dieselbe Edit(path)-Allowlist-Mechanik wie im restricted-
+            # Tier. Bewusst KEIN Bypass+disallowTools mehr: einer globalen 'Edit'-Disallow
+            # könnte keine Allow-Regel den Memory-Pfad wieder öffnen (Disallow gewinnt) —
+            # die Allowlist hält Code schreibgeschützt UND Memory schreibbar zugleich.
+            ALLOWED_TOOLS="Read,Glob,Grep,Bash,Edit(.claude/memory/*),Edit(.claude/memory/**)"
+            [ "$NEEDS_MCP" = "true" ] && [ -n "$MCP_TOOLS" ] && ALLOWED_TOOLS="$ALLOWED_TOOLS,$MCP_TOOLS"
+            echo "invoke-args=--allowedTools '$ALLOWED_TOOLS' $MODEL_FLAG" >> "$GITHUB_OUTPUT"
+            ;;
+          full)
+            # Tier 2 — vollautonom (Bypass + volles Toolset inkl. Write/Edit).
+            ALLOWED_TOOLS="$VOLLES_TOOLSET"
+            [ "$NEEDS_MCP" = "true" ] && [ -n "$MCP_TOOLS" ] && ALLOWED_TOOLS="$ALLOWED_TOOLS,$MCP_TOOLS"
+            echo "invoke-args=--dangerously-skip-permissions --allowedTools '$ALLOWED_TOOLS' $MODEL_FLAG" >> "$GITHUB_OUTPUT"
+            ;;
+          *)
+            echo "::error title=Ungueltiges tools-tier::tools-tier='$TOOLS_TIER' — erlaubt: restricted | review | full"
+            exit 1
+            ;;
+        esac
+
+    # Memory-Save findet sich NICHT hier (die Action läuft ausschließlich pre-claude).
+    # Phasen (01..05) laden nach dem claude-Step das Memory als Artefakt hoch (upload-artifact,
+    # Name = memory-save-Key) — das Artefakt IST der Speicher, es folgt kein Cache-Save mehr
+    # (Cache-Writes sind für diese Trigger platform-seitig gesperrt, s. Kopf-Kommentar).
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # PIPELINE-REPO-CHECKOUT — Skripte + Prompts für die Callee-Workflows
+    #
+    # Callee-Jobs laufen im KONSUMENTEN-Repo (Workspace = Konsumenten-Checkout). Skripte
+    # (pr-for-issue.sh, pr-doc-*.sh) und zentrale Prompts liegen im Pipeline-Repo und werden
+    # hier nach .agent-pipeline/ gestellt. Token: das oben gemintete App-Token (GITHUB_TOKEN
+    # ist repo-scoped und kann kein anderes Repo lesen). persist-credentials:false — der
+    # origin-Remote des Konsumenten-Checkouts soll die EINZIGE Credential behalten (s. Git-
+    # Remote-Step oben). Fail-closed: fehlt das Verzeichnis, endet die Action rot statt
+    # Folge-Steps mit fehlenden Dateien.
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    - name: Pipeline-Repo auschecken (.agent-pipeline)
+      id: pipeline-check
+      if: steps.preflight.outputs.configured == 'true' && inputs.pipeline-checkout == 'true'
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        repository: ${{ inputs.pipeline-repo }}
+        ref: ${{ inputs.pipeline-ref }}
+        token: ${{ steps.gh-token.outputs.token }}
+        path: .agent-pipeline
+        persist-credentials: false
+
+    - name: Pipeline-Checkout verifizieren (fail-closed)
+      if: steps.preflight.outputs.configured == 'true' && inputs.pipeline-checkout == 'true'
+      shell: bash
+      run: |
+        if [ ! -d .agent-pipeline/.github/scripts ] || [ ! -d .agent-pipeline/.github/prompts ]; then
+          echo "::error title=Pipeline-Checkout unvollständig::.agent-pipeline fehlt .github/scripts oder .github/prompts — Callee-Steps würden auf fehlende Dateien laufen. App-Installation auf '${{ inputs.pipeline-repo }}' und Tag '${{ inputs.pipeline-ref }}' prüfen."
+          exit 1
+        fi
+        SHA="$(git -C .agent-pipeline rev-parse HEAD)"
+        echo "pipeline-sha=$SHA" >> "$GITHUB_OUTPUT"
+        echo "::notice title=📦 agent-pipeline::Ref ${{ inputs.pipeline-ref }} @ ${SHA:0:12} nach .agent-pipeline ausgecheckt."
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # TAILSCALE EXIT-NODE — LLM-Egress über eine feste IP (z.ai/OpenRouter-Flagging-Schutz)
+    #
+    # Letzter Akt VOR dem claude-Step (der im Caller läuft): verbindet den Runner mit dem
+    # Exit-Node, sodass der gesamte folgende LLM-Traffic über den Nürnberger Server egressiert.
+    # Pre-LLM-Setup (Token/Cache/npm install oben) bleibt bewusst DIREKT (keine Exit-Node-Last
+    # für GitHub/npm). Kill-Switch: tailscale-exit-node leer → alle drei Schritte übersprungen
+    # (if-Bedingung). Fail-closed: Exit-Node gesetzt, aber Key fehlt oder Connect scheitert →
+    # setup-claude rot → claude-Step übersprungen (lieber gar nicht laufen als LLM von Azure-IP
+    # und wieder geflaggt werden).
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    - name: Tailscale-Preflight (Auth-Key ist Pflicht bei aktivem Exit-Node)
+      # Ohne diesen Check wäre ein fehlender/leerer TAILSCALE_AUTH_KEY ein stiller Fail-OPEN:
+      # Connect- und DNS-Step würden per if-Bedingung übersprungen, setup-claude bliebe grün und
+      # claude -p liefe direkt von der Azure-Runner-IP. Kill-Switch ist ausschließlich
+      # tailscale-exit-node — ein fehlender Key ist eine Fehlkonfiguration und muss laut scheitern.
+      if: steps.preflight.outputs.configured == 'true' && inputs.tailscale-exit-node != ''
+      shell: bash
+      env:
+        TAILSCALE_AUTHKEY: ${{ inputs.tailscale-authkey }}
+      run: |
+        if [ -z "$TAILSCALE_AUTHKEY" ]; then
+          echo "::error::TAILSCALE_EXIT_NODE ist gesetzt, aber TAILSCALE_AUTH_KEY fehlt — fail-closed (kein LLM-Egress von der Azure-IP)."
+          exit 1
+        fi
+
+    - name: Tailscale-Exit-Node verbinden (LLM-Egress über feste IP)
+      if: steps.preflight.outputs.configured == 'true' && inputs.tailscale-exit-node != ''
+      uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
+      with:
+        authkey: ${{ inputs.tailscale-authkey }}
+        args: --exit-node=${{ inputs.tailscale-exit-node }} --exit-node-allow-lan-access=true
+
+    - name: ✅ Tailscale-Verbindung bestätigen
+      # Macht den Connect im Workflow-Log sofort sichtbar: prominente Notice oben im Job,
+      # statt im tailscale/github-action-Step-Output vergraben. Läuft NACH dem Connect-Step
+      # (der bei Misserfolg selbst rot wird) → hier steht die Verbindung bereits.
+      if: steps.preflight.outputs.configured == 'true' && inputs.tailscale-exit-node != ''
+      shell: bash
+      run: |
+        sleep 2  # tailscaled kurz Zeit geben, Status zu aktualisieren
+        if tailscale status >/dev/null 2>&1; then
+          SELF_IP=$(tailscale ip -4 2>/dev/null | head -1)
+          echo "::notice title=✅ Tailscale Exit-Node verbunden::Tailscale aktiv (Runner-IP: ${SELF_IP:-?}). LLM-Traffic routet über Nürnberg."
+          echo "Tailscale-Status: verbunden, Runner-Tailscale-IP: ${SELF_IP:-unbekannt}"
+        else
+          echo "::warning::tailscale status nicht verfügbar — Exit-Node evtl. nicht aktiv."
+        fi
+
+    - name: DNS fixen + Egress-IP protokollieren
+      # Exit-Node-Routing bricht die Azure-Standard-DNS des Runners: systemd-resolved im
+      # Stub-Modus intercepted DNS-Queries und fragt weiterhin den Azure-DNS (168.63.129.16),
+      # der durch den Tunnel nicht erreichbar ist. Ohne diesen Step macht der Connect zwar
+      # grün, aber claude -p erreicht seinen Provider nicht (curl exit 28 / DNS-Failure).
+      # Fix: systemd-resolved stoppen, Stub-Symlink entfernen, echte resolv.conf mit
+      # öffentlichen Resolvern schreiben (über den Tunnel erreichbar).
+      # Zusätzlich wird die egressierende IP + Standort abgefragt → pro Lauf im Log sichtbar,
+      # dass der LLM-Traffic wirklich über den Nürnberger Exit Node läuft.
+      if: steps.preflight.outputs.configured == 'true' && inputs.tailscale-exit-node != ''
+      shell: bash
+      run: |
+        sudo systemctl stop systemd-resolved 2>/dev/null || true
+        sudo rm -f /etc/resolv.conf
+        echo "nameserver 1.1.1.1" | sudo tee /etc/resolv.conf >/dev/null
+        echo "nameserver 8.8.8.8" | sudo tee -a /etc/resolv.conf >/dev/null
+        if getent hosts api.anthropic.com >/dev/null 2>&1; then
+          # Egress-IP über den Exit Node abfragen (verifiziert das Routing pro Lauf sichtbar).
+          EGRESS=$(curl -s --max-time 5 https://ipinfo.io/json 2>/dev/null || echo "")
+          if [ -n "$EGRESS" ]; then
+            IP=$(printf '%s' "$EGRESS" | jq -r '.ip // "?"')
+            CITY=$(printf '%s' "$EGRESS" | jq -r '.city // "?"')
+            COUNTRY=$(printf '%s' "$EGRESS" | jq -r '.country // "?"')
+            echo "::notice title=🌐 LLM-Egress über Tailscale::Exit-Node aktiv — IP ${IP} (${CITY}, ${COUNTRY})."
+            echo "Egress-IP: ${IP} (${CITY}, ${COUNTRY})"
+          else
+            echo "::notice::Tailscale-Exit-Node aktiv + DNS via 1.1.1.1/8.8.8.8 (Egress-IP nicht abrufbar)."
+          fi
+        else
+          echo "::error::DNS-Auflösung schlägt trotz Resolver-Wechsel fehl — Exit-Node/Forwarding prüfen."
+          exit 1
+        fi
