@@ -31,8 +31,10 @@ dünne Dispatcher-Stubs und laufen trotzdem vollständig im eigenen Kontext.
 3. Optional Vars: `LLM_PROVIDER` (claude|zai|openrouter, Default claude),
    `CLAUDE_MODEL_*` (Defaults: fable/sonnet/opus/haiku je Phase),
    `CLAUDE_CODE_SETTINGS_LOCAL_*`, `TAILSCALE_EXIT_NODE`.
-4. Access-Freigabe prüfen (einmalig): Settings → Actions → General → Access →
-   „Accessible from repositories in the ‹account›“.
+4. Entfällt seit dem Public-Wechsel: Das Repo ist öffentlich — jede
+   Konsumenten-Sichtbarkeit (privat oder public) kann konsumieren. (Die frühere
+   Access-Freigabe galt nur privat-zu-privat; ein öffentlicher Konsument konnte
+   private Provider NICHT auflösen — HTTP 422, am 17.08.2026 live belegt.)
 5. Bootstrap (aus der Wurzel des Konsumenten-Repos):
 
    ```bash
@@ -75,7 +77,9 @@ Repo-spezifische Konfiguration läuft über Stub-Inputs: `install-command`,
 
 - Dieses Repo enthält **keine Secrets** (nur Durchreicherei über
   `workflow_call.secrets`). Audit-Regel: so halten.
-- Access begrenzt auf Repos des eigenen Accounts.
+- Repo ist öffentlich (seit 17.08.2026, secret-frei auditiert): jeder kann die
+  Workflows lesen und konsumieren — Vertrauensgrenze bleibt der eigene Account
+  für Schreibzugriffe (Branch-Protection: kein Direktpush, kein Force-Push).
 - Wer dieses Repo kompromittiert, führt Code in allen Konsumenten aus — deshalb:
   Minor-Tag-Pinning, keine beweglichen Refs in Stubs und (nach Pro-Upgrade)
   Branch-Protection auf main.
