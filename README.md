@@ -49,7 +49,11 @@ Repo-spezifische Konfiguration läuft über Stub-Inputs: `install-command`,
 
 ## Release-Runbook (Minor-Tags)
 
-- `main` = Entwicklung. **Kein Direktpush, kein Force-Push** (Branch-Protection).
+- `main` = Entwicklung. **Branch-Protection ist auf privaten Repos nicht verfügbar
+  (GitHub Free) — Ersatz-Disziplin:** Änderungen nur über Commits + Tags mit
+  Runbook, kein Force-Push, kein Tag-Move nach Konsumenten-Pin. Bei einem
+  GitHub-Pro-Upgrade: Protection auf main nachholen (kein Direktpush, kein
+  Force-Push).
 - Release: PR mergen → Checklist:
   1. Defaults synchronisieren: `pipeline-ref`-Default in
      `.github/actions/setup-claude/action.yml`, die `Ref v1.x`-Zeilen der
@@ -73,7 +77,8 @@ Repo-spezifische Konfiguration läuft über Stub-Inputs: `install-command`,
   `workflow_call.secrets`). Audit-Regel: so halten.
 - Access begrenzt auf Repos des eigenen Accounts.
 - Wer dieses Repo kompromittiert, führt Code in allen Konsumenten aus — deshalb:
-  Branch-Protection, Minor-Tag-Pinning, keine beweglichen Refs in Stubs.
+  Minor-Tag-Pinning, keine beweglichen Refs in Stubs und (nach Pro-Upgrade)
+  Branch-Protection auf main.
 - Fork-PRs: Guards leben als Stub-job-`if:` VOR dem Call; der Callee wird bei
   Forks nie erreicht.
 
